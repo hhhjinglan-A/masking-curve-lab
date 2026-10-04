@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+
+# Word files stay local; the report is published as README.md and web/downloads/masking_report.pdf
+*.docx
+~$*

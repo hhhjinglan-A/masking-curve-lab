@@ -1,0 +1,2054 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Masking Curve Lab</title>
+<!--
+  MASKING CURVE LAB — single-file web app for measuring your own frequency-masking curves.
+
+  How the code is organised (search for the numbered banners in the <script>):
+    1. Constants ............ every experimental parameter (durations, ramps, staircase rules, safety cap)
+    2. Small helpers ........ formatting, statistics, DOM shortcuts
+    3. Storage .............. localStorage persistence (always wrapped in try/catch)
+    4. Audio engine ......... Web Audio API: tones, narrowband noise, raised-cosine ramps, safety limiter
+    5. Staircase ............ the adaptive 1-up/1-down and 2-down/1-up procedures
+    6. Run controller ....... runs one staircase or a whole randomized curve, pause/abort, break reminder
+    7. Manual trials ........ Part 1 of the assignment
+    8. Aggregation .......... repeats -> mean threshold; masking = masked - baseline
+    9. Charts ............... hand-drawn SVG (no external libraries, works offline)
+   10. Table, data export/import
+   11. UI wiring ............ settings, keyboard shortcuts, initial render
+
+  No build step, no external libraries: double-click the file to open it in Chrome.
+-->
+<style>
+  /* ---------- Colour tokens (light) ---------- */
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --surface-2: #f2f1ed;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --accent: #2a78d6;
+    --accent-wash: rgba(42, 120, 214, 0.12);
+    --good: #006300;
+    --bad: #c42f2f;
+    --note-bg: #eef4fc;
+    --note-ink: #1c3f6e;
+    --warn-bg: #fff4dc;
+    --warn-ink: #6b4a00;
+    /* categorical series slots — fixed order, colour follows the masker frequency */
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+    --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  }
+  /* ---------- Colour tokens (dark) ---------- */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface: #1a1a19; --surface-2: #242422;
+      --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+      --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10);
+      --accent: #3987e5; --accent-wash: rgba(57, 135, 229, 0.18);
+      --good: #2fbf2f; --bad: #e66767;
+      --note-bg: #16212f; --note-ink: #bcd5f5; --warn-bg: #2a2310; --warn-ink: #f3cf7a;
+      --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+      --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #242422;
+    --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5; --accent-wash: rgba(57, 135, 229, 0.18);
+    --good: #2fbf2f; --bad: #e66767;
+    --note-bg: #16212f; --note-ink: #bcd5f5; --warn-bg: #2a2310; --warn-ink: #f3cf7a;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  }
+
+  /* ---------- Base ---------- */
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1440px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 24px; line-height: 1.2; margin: 2px 0 2px; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 0; font-weight: 650; }
+  p { margin: 6px 0; }
+  .eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; }
+  .sub { color: var(--ink-2); margin: 0; }
+  .tag { font-size: 11px; font-weight: 500; color: var(--muted); margin-left: 6px; }
+  .hint { color: var(--ink-2); font-size: 12.5px; }
+  .hint:empty { display: none; }
+  kbd {
+    font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 5px; margin-left: 4px;
+    border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; color: var(--ink-2); background: var(--surface);
+  }
+
+  header.top { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .top-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+  .notice { border-radius: 10px; padding: 10px 14px; margin: 0 0 12px; background: var(--note-bg); color: var(--note-ink); font-size: 13px; }
+  .notice.warn { background: var(--warn-bg); color: var(--warn-ink); }
+  .notice button { margin-left: 6px; padding: 4px 10px; }
+
+  /* ---------- Layout ---------- */
+  .layout { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 1020px) { .layout { grid-template-columns: 390px minmax(0, 1fr); } }
+  .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; min-width: 0; }
+  .card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  .card > h2 { margin-bottom: 10px; }
+  body.report #controlsCol, body.report #runCard { display: none; }
+  body.report .layout { grid-template-columns: minmax(0, 1fr); }
+
+  /* ---------- Form controls ---------- */
+  fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+  fieldset:disabled { opacity: 0.55; }
+  .field { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 8px; align-items: center; margin: 10px 0; }
+  .field > .lbl { color: var(--ink-2); font-size: 13px; }
+  .ctl { display: flex; gap: 8px; align-items: center; min-width: 0; }
+  .ctl input[type=range] { flex: 1; min-width: 0; }
+  output, .num-out { font-variant-numeric: tabular-nums; min-width: 86px; text-align: right; color: var(--ink); font-weight: 600; }
+  input[type=range] { accent-color: var(--accent); }
+  input[type=number], input[type=text], select {
+    background: var(--surface-2); color: var(--ink); border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 8px; font: inherit; min-width: 0;
+  }
+  input[type=number] { width: 92px; }
+  input[type=text] { width: 100%; }
+  .unit { color: var(--muted); font-size: 12px; }
+  button {
+    font: inherit; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--ink);
+    padding: 8px 12px; cursor: pointer; line-height: 1.2;
+  }
+  button:hover:not(:disabled) { border-color: var(--axis); }
+  button.primary { background: var(--accent); color: #fff; border-color: transparent; font-weight: 600; }
+  button.primary kbd { color: #fff; background: transparent; border-color: rgba(255,255,255,.5); }
+  button.danger { color: var(--bad); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .check { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+
+  /* segmented radio control */
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface-2); }
+  .seg label { position: relative; cursor: pointer; }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .seg span { display: block; padding: 6px 10px; font-size: 13px; color: var(--ink-2); }
+  .seg input:checked + span { background: var(--accent); color: #fff; font-weight: 600; }
+  .seg input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  details > summary { cursor: pointer; list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary h2 { display: inline; }
+  details > summary::after { content: " ▸"; color: var(--muted); }
+  details[open] > summary::after { content: " ▾"; }
+  .steps { padding-left: 20px; margin: 10px 0 0; }
+  .steps li { margin: 5px 0; }
+  .small { font-size: 12.5px; color: var(--ink-2); }
+  .small ul { padding-left: 18px; margin: 6px 0; }
+  .error { color: var(--bad); font-size: 12.5px; }
+  .error:empty { display: none; }
+
+  .minilog { list-style: none; padding: 0; margin: 8px 0 0; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .minilog li { padding: 2px 0; border-top: 1px solid var(--grid); }
+
+  /* ---------- Run panel ---------- */
+  .pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--border); font-weight: 600; }
+  .pill.running { background: var(--accent-wash); color: var(--accent); }
+  .status { font-size: 15px; font-weight: 600; min-height: 22px; margin: 0 0 8px; }
+  .progress { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+  .progress > div { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .3s; }
+  .runmeta { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 10px 0; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .runmeta b { color: var(--ink); font-weight: 600; }
+  .resp { display: flex; gap: 12px; margin: 12px 0 8px; }
+  .resp-btn { flex: 1; font-size: 18px; padding: 18px 12px; font-weight: 600; }
+  .interval {
+    flex: 1; padding: 14px 12px; display: flex; flex-direction: column; align-items: center; gap: 4px;
+    border-width: 2px; transition: background .08s, border-color .08s;
+  }
+  .interval .n { font-size: 32px; font-weight: 700; line-height: 1; }
+  .interval .k { font-size: 12px; color: var(--muted); }
+  .interval.lit { background: var(--accent-wash); border-color: var(--accent); }
+  .resp-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .feedback { font-weight: 700; font-size: 15px; min-width: 100px; }
+  .feedback.good { color: var(--good); }
+  .feedback.bad { color: var(--bad); }
+  .elapsed { margin-left: auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+  /* ---------- Charts ---------- */
+  .chart { width: 100%; position: relative; margin-top: 8px; }
+  .chart svg { display: block; max-width: 100%; height: auto; }
+  .chart text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 11px; fill: var(--muted); }
+  .chart .tick { font-variant-numeric: tabular-nums; }
+  .chart .axis-title { fill: var(--ink-2); font-size: 12px; }
+  .chart .ink { fill: var(--ink); }
+  .chart .ink2 { fill: var(--ink-2); }
+  .chart .empty { fill: var(--muted); font-size: 13px; }
+  .chart .grid { stroke: var(--grid); stroke-width: 1; }
+  .chart .base { stroke: var(--axis); stroke-width: 1; }
+  .chart .halo { paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
+  .chart .hit { fill: transparent; cursor: crosshair; }
+  .filters { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-bottom: 6px; font-size: 13px; color: var(--ink-2); }
+  .filters label { display: inline-flex; align-items: center; gap: 6px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12.5px; color: var(--ink-2); margin-top: 6px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend svg { flex: none; }
+  .caption { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  #tip {
+    position: fixed; z-index: 50; pointer-events: none; background: var(--surface); color: var(--ink);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; font-size: 12px; line-height: 1.45;
+    box-shadow: 0 4px 14px rgba(0,0,0,.14); max-width: 260px; font-variant-numeric: tabular-nums;
+  }
+  #tip b { font-weight: 650; }
+
+  /* ---------- Table ---------- */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 13px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--grid); text-align: right; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; border-bottom-color: var(--axis); }
+  th:first-child, td:first-child { text-align: left; }
+  td.act { text-align: right; }
+  td.act button { padding: 3px 8px; font-size: 12px; }
+  tr.section td { color: var(--ink-2); font-weight: 650; background: var(--surface-2); text-align: left; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .warnmark { color: var(--bad); font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div>
+    <div class="eyebrow">Psychoacoustics · class project</div>
+    <h1>Masking Curve Lab</h1>
+    <p class="sub">Measure your own frequency-masking curves with headphones.</p>
+  </div>
+  <div class="top-actions">
+    <button id="reportBtn" type="button">Report view</button>
+    <select id="themeSel" aria-label="Theme">
+      <option value="auto">Theme: auto</option>
+      <option value="light">Theme: light</option>
+      <option value="dark">Theme: dark</option>
+    </select>
+  </div>
+</header>
+
+<div class="notice" role="note">
+  <b>Uncalibrated system.</b> All levels are in <b>dBFS</b> (decibels relative to digital full scale), <b>not dB SPL</b>.
+  The real loudness at your ear depends on your computer volume and headphones, so only <i>differences</i> between levels
+  (such as the amount of masking) are meaningful. Safety: nothing louder than −10 dBFS is ever played.
+</div>
+<div class="notice" id="authorNote" hidden>
+  <b>Showing the author's measured data</b> (Method B, pure-tone masker at −30 dBFS, collected 2026-10-03), loaded from
+  <code>data/masking_data.json</code>. Press <i>Clear all data</i> under “Data” to start your own measurement.
+</div>
+<div class="notice warn" id="storageWarn" hidden>
+  Your browser is blocking local storage, so data will <b>not</b> survive a page reload. Export JSON regularly.
+</div>
+<div class="notice warn" id="breakBanner" hidden>
+  <b>Break time.</b> You've been listening for about 10 minutes — rest your ears for a minute or two.
+  <button id="breakPauseBtn" type="button">Pause now</button>
+  <button id="breakDismissBtn" type="button">Dismiss</button>
+</div>
+
+<main class="layout">
+
+<!-- ======================= LEFT COLUMN: CONTROLS ======================= -->
+<aside class="col" id="controlsCol">
+
+  <section class="card">
+    <details id="instructions" open>
+      <summary><h2>Before you start</h2></summary>
+      <ol class="steps">
+        <li><b>Use headphones</b>, not laptop speakers. Turn off spatial audio, EQ and other sound "enhancements".</li>
+        <li><b>Quiet room.</b> Close apps that make sounds and silence notifications.</li>
+        <li><b>Set the volume once.</b> Start with your computer volume low, press <i>Comfort check</i>, and raise the volume until the masker is clearly audible but comfortable. Then press <i>Loudest-sound check</i> — it must never feel unpleasant.</li>
+        <li><b>Don't change the system volume</b> during the experiment, or your thresholds will shift.</li>
+        <li><b>Take a break every ~10 minutes.</b> The app reminds you; use <i>Pause</i>.</li>
+        <li>Answer honestly. In yes/no mode some trials contain <i>no</i> probe (catch trials). In two-interval mode, guess if unsure.</li>
+        <li>Suggested order: measure the <b>baseline</b> (masker off) first, then the <b>masked</b> curve for each masker frequency.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- Masker settings are shared by Part 1 and Parts 2–3 -->
+  <section class="card">
+    <h2>Masker <span class="tag">shared by all parts</span></h2>
+    <fieldset id="stimFields">
+      <div class="field">
+        <span class="lbl">Frequency</span>
+        <div class="ctl">
+          <select id="maskerFreqSel" aria-label="Masker frequency">
+            <option value="500">500 Hz</option>
+            <option value="1000">1000 Hz</option>
+            <option value="2000">2000 Hz</option>
+            <option value="4000">4000 Hz</option>
+            <option value="custom">Custom…</option>
+          </select>
+          <input id="maskerFreqCustom" type="number" min="50" max="8000" step="1" aria-label="Custom masker frequency" hidden>
+          <span class="unit" id="maskerFreqUnit" hidden>Hz</span>
+        </div>
+      </div>
+      <div class="field">
+        <span class="lbl">Type</span>
+        <div class="seg" role="radiogroup" aria-label="Masker type">
+          <label><input type="radio" name="maskerType" value="tone"><span>Pure tone</span></label>
+          <label><input type="radio" name="maskerType" value="noise"><span>⅓-octave noise</span></label>
+        </div>
+      </div>
+      <div class="field">
+        <span class="lbl">Level</span>
+        <div class="ctl">
+          <input type="range" id="maskerLevel" min="-60" max="-10" step="1" aria-label="Masker level">
+          <output id="maskerLevelOut"></output>
+        </div>
+      </div>
+      <p class="hint" id="maskerHint"></p>
+    </fieldset>
+    <div class="btnrow">
+      <button id="comfortBtn" type="button">▶ Comfort check (masker alone)</button>
+      <button id="loudBtn" type="button">▶ Loudest-sound check</button>
+    </div>
+    <p class="hint">Set your computer volume once with the comfort check, then <b>leave it alone</b> for the whole experiment. The loudest-sound check plays a 1 kHz tone at −10 dBFS, the maximum this app can ever produce.</p>
+  </section>
+
+  <!-- Part 1: manual exploration -->
+  <section class="card">
+    <h2>Part 1 · Manual trials</h2>
+    <fieldset id="manualFields">
+      <label class="check"><input type="checkbox" id="maskerOn"> Masker on</label>
+      <div class="field">
+        <span class="lbl">Probe freq.</span>
+        <div class="ctl">
+          <input type="range" id="probeFreqSlider" min="0" max="1000" step="1" aria-label="Probe frequency (log slider)">
+          <input type="number" id="probeFreq" min="100" max="10000" step="1" aria-label="Probe frequency in Hz">
+          <span class="unit">Hz</span>
+        </div>
+      </div>
+      <div class="field">
+        <span class="lbl">Probe level</span>
+        <div class="ctl">
+          <input type="range" id="probeLevel" min="-100" max="-10" step="1" aria-label="Probe level">
+          <output id="probeLevelOut"></output>
+        </div>
+      </div>
+      <div class="btnrow">
+        <button class="primary" id="manPlayBtn" type="button">▶ Play trial <kbd>Space</kbd></button>
+        <button id="manHeardBtn" type="button" disabled>Heard <kbd>H</kbd></button>
+        <button id="manNotBtn" type="button" disabled>Not heard <kbd>N</kbd></button>
+      </div>
+    </fieldset>
+    <p class="hint" id="manualHint"></p>
+    <ul class="minilog" id="manualLog"></ul>
+  </section>
+
+  <!-- Parts 2–3: adaptive measurement -->
+  <section class="card">
+    <h2>Parts 2–3 · Measurement</h2>
+    <fieldset id="measureFields">
+      <div class="field">
+        <span class="lbl">Method</span>
+        <div class="seg" role="radiogroup" aria-label="Method">
+          <label><input type="radio" name="method" value="B"><span>B · Yes/No</span></label>
+          <label><input type="radio" name="method" value="C"><span>C · 2IFC</span></label>
+        </div>
+      </div>
+      <div class="field">
+        <span class="lbl">Condition</span>
+        <div class="seg" role="radiogroup" aria-label="Condition">
+          <label><input type="radio" name="condition" value="masked"><span>With masker</span></label>
+          <label><input type="radio" name="condition" value="baseline"><span>Baseline (no masker)</span></label>
+        </div>
+      </div>
+      <div class="field">
+        <span class="lbl">Scope</span>
+        <div class="seg" role="radiogroup" aria-label="Scope">
+          <label><input type="radio" name="scope" value="full"><span>Run full curve</span></label>
+          <label><input type="radio" name="scope" value="single"><span>Single point</span></label>
+        </div>
+      </div>
+      <div class="field" style="align-items:start">
+        <span class="lbl" style="padding-top:6px">Probe freqs</span>
+        <div>
+          <input type="text" id="probeList" aria-label="Probe frequencies in Hz, comma separated" spellcheck="false">
+          <div class="error" id="listError"></div>
+          <p class="hint" id="listHint"></p>
+          <button id="resetListBtn" type="button" style="padding:4px 10px;font-size:12px">Reset to default ratios</button>
+        </div>
+      </div>
+      <div class="field" id="singleField">
+        <span class="lbl">Probe</span>
+        <div class="ctl"><select id="singleProbeSel" aria-label="Probe frequency for single point"></select></div>
+      </div>
+    </fieldset>
+    <div class="btnrow">
+      <button class="primary" id="startBtn" type="button">Start</button>
+      <button id="pauseBtn" type="button" disabled>Pause</button>
+      <button id="abortBtn" type="button" disabled>Abort</button>
+    </div>
+    <details class="small" style="margin-top:12px">
+      <summary>How the staircases work</summary>
+      <ul>
+        <li>Probe starts at −20 dBFS (clearly audible). Level range −100 to −10 dBFS.</li>
+        <li><b>B · Yes/No:</b> heard → probe 1 step softer, not heard → 1 step louder (1-up/1-down, converges on the ~50 % "heard" point). About 10 % of trials are catch trials (masker only, no probe); they don't move the staircase but false "heard" answers are logged.</li>
+        <li><b>C · 2IFC:</b> two intervals 400 ms apart; one has the probe. Two correct in a row → softer, one wrong → louder (2-down/1-up, ~70.7 % correct).</li>
+        <li>Step 6 dB until 2 reversals, then 2 dB. Stops after 8 reversals; threshold = mean of the last 6 reversal levels. Safety stop after 100 trials (marked "did not converge").</li>
+        <li>Timing: masker 500 ms; probe 300 ms, centred inside the masker; 20 ms raised-cosine ramps on every sound.</li>
+      </ul>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>Data</h2>
+    <p class="hint" id="dataSummary"></p>
+    <div class="btnrow">
+      <button id="expTrialsBtn" type="button">⬇ Trials CSV</button>
+      <button id="expThrBtn" type="button">⬇ Thresholds CSV</button>
+      <button id="expJsonBtn" type="button">⬇ All data (JSON)</button>
+      <button id="impJsonBtn" type="button">⬆ Import JSON</button>
+      <input type="file" id="impFile" accept="application/json,.json" hidden>
+      <button id="authorDataBtn" type="button">Load author's data</button>
+      <button id="clearBtn" class="danger" type="button">Clear all data</button>
+    </div>
+    <p class="hint">Data is saved automatically in this browser. Importing merges with what's already stored (duplicates are skipped).</p>
+  </section>
+</aside>
+
+<!-- ======================= RIGHT COLUMN: RUN + DASHBOARD ======================= -->
+<div class="col">
+
+  <section class="card" id="runCard">
+    <div class="card-head">
+      <h2>Current run</h2>
+      <span class="pill" id="runPill">Idle</span>
+    </div>
+    <p class="status" id="runStatus" aria-live="polite"></p>
+    <div class="progress" aria-hidden="true"><div id="progBar"></div></div>
+    <div class="runmeta" id="runMeta"></div>
+
+    <div class="resp" id="respB">
+      <button class="resp-btn" id="heardBtn" type="button" disabled>Heard <kbd>H</kbd></button>
+      <button class="resp-btn" id="notHeardBtn" type="button" disabled>Not heard <kbd>N</kbd></button>
+    </div>
+    <div class="resp" id="respC" hidden>
+      <button class="interval" id="int1" type="button" disabled><span class="n">1</span><span class="k">press 1</span></button>
+      <button class="interval" id="int2" type="button" disabled><span class="n">2</span><span class="k">press 2</span></button>
+    </div>
+    <div class="resp-foot">
+      <button id="replayBtn" type="button" disabled>↻ Replay <kbd>Space</kbd></button>
+      <span class="feedback" id="feedback" aria-live="polite"></span>
+      <span class="elapsed" id="elapsed"></span>
+    </div>
+
+    <div class="chart" id="stairChart"></div>
+    <div class="legend" id="stairLegend"></div>
+    <p class="hint" id="lastResult"></p>
+  </section>
+
+  <section class="card" id="dashCard">
+    <div class="card-head"><h2 id="chartTitle">Masking curves</h2></div>
+    <div class="filters">
+      <div class="seg" role="radiogroup" aria-label="Y axis">
+        <label><input type="radio" name="yMode" value="threshold"><span>Threshold (dBFS)</span></label>
+        <label><input type="radio" name="yMode" value="masking"><span>Masking amount (dB)</span></label>
+      </div>
+      <label><input type="checkbox" id="showBaseline"> Show baseline</label>
+      <label>Method
+        <select id="fMethod"><option value="B">B · Yes/No</option><option value="C">C · 2IFC</option></select>
+      </label>
+      <label>Masker
+        <select id="fType"><option value="tone">Tone</option><option value="noise">Noise</option></select>
+      </label>
+      <label>Level <select id="fLevel"></select></label>
+    </div>
+    <div class="legend" id="curveLegend"></div>
+    <div class="chart" id="curveChart"></div>
+    <p class="caption" id="chartCaption"></p>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2 id="tableTitle">Results</h2></div>
+    <div class="table-wrap"><table id="resultsTable"></table></div>
+    <p class="hint">“+1 repeat” re-runs that point once more; the chart and table use the mean across repeats. Staircases that didn't converge stay in the exported data but are left out of the mean.</p>
+  </section>
+</div>
+</main>
+</div>
+
+<div id="tip" hidden></div>
+
+<script>
+'use strict';
+
+/* =====================================================================
+   1. CONSTANTS — every experimental parameter lives here
+   ===================================================================== */
+
+// Safety: no single sound may exceed this level, and a hard limiter on the
+// output bus guarantees no output sample ever exceeds it either.
+const SAFETY_CAP_DBFS = -10;
+
+const PROBE_MIN_DBFS = -100;          // softest probe the staircase may reach
+const PROBE_MAX_DBFS = -10;           // loudest probe (= safety cap)
+const NOISE_MASKER_MAX_DBFS = -20;    // noise peaks are ~9.5 dB above a same-level tone's peak, so cap it lower
+
+// Timing (seconds)
+const MASKER_DUR = 0.500;                          // masker duration
+const PROBE_DUR = 0.300;                           // probe duration
+const PROBE_DELAY = (MASKER_DUR - PROBE_DUR) / 2;  // 0.100 s → probe centred inside the masker
+const RAMP_DUR = 0.020;                            // raised-cosine on/off ramp on every sound
+const ISI_2IFC = 0.400;                            // silent gap between the two 2IFC intervals
+
+// Default probe frequencies = masker frequency × these ratios
+const DEFAULT_RATIOS = [0.5, 0.7, 0.85, 0.95, 1.0, 1.05, 1.2, 1.5, 2.0];
+
+// Adaptive staircase rules (shared by Method B and Method C)
+const STAIRCASE = {
+  startLevel: -20,           // dBFS, clearly audible
+  bigStep: 6,                // dB, used until `reversalsBeforeSmallStep` reversals
+  smallStep: 2,              // dB, used afterwards
+  reversalsBeforeSmallStep: 2,
+  stopAfterReversals: 8,
+  averageLastN: 6,           // threshold = mean of the last 6 reversal levels
+  maxTrials: 100,            // safety stop if the track never converges
+};
+
+const CATCH_TRIAL_RATE = 0.10;              // Method B: fraction of masker-only trials
+const BREAK_INTERVAL_MS = 10 * 60 * 1000;   // break reminder every 10 minutes of listening
+
+const DATA_KEY = 'maskingCurveLab.data.v1';
+const SETTINGS_KEY = 'maskingCurveLab.settings.v1';
+
+const METHOD_LABEL = { B: 'B · Yes/No (1-up/1-down)', C: 'C · 2IFC (2-down/1-up)', manual: 'Manual' };
+const TYPE_LABEL = { tone: 'tone', noise: '⅓-octave noise' };
+
+/* =====================================================================
+   2. SMALL HELPERS
+   ===================================================================== */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+const stdev = a => { if (a.length < 2) return null; const m = mean(a); return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1)); };
+const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
+const radioVal = name => { const r = $(`input[name="${name}"]:checked`); return r ? r.value : null; };
+const setRadio = (name, value) => { const r = $(`input[name="${name}"][value="${value}"]`); if (r) r.checked = true; };
+const shuffle = arr => { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; };
+
+// Number formatting for display (true minus sign; CSV export uses plain numbers)
+function fmtDb(x, digits = 1) {
+  if (x == null || !Number.isFinite(x)) return '—';
+  const s = Math.abs(x).toFixed(digits);
+  return (x < 0 && Number(s) !== 0 ? '−' : '') + s;
+}
+function fmtHz(f) {
+  if (f == null) return '—';
+  if (f >= 1000) return (f / 1000).toFixed(f % 1000 === 0 ? 0 : f % 100 === 0 ? 1 : 2) + ' kHz';
+  return Math.round(f) + ' Hz';
+}
+const fmtTime = ms => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+/* =====================================================================
+   3. STORAGE — localStorage, every access wrapped in try/catch
+   ===================================================================== */
+const Store = {
+  load(key, fallback) {
+    try {
+      const s = localStorage.getItem(key);
+      return s ? JSON.parse(s) : fallback;
+    } catch (e) {
+      showStorageWarning();
+      return fallback;
+    }
+  },
+  save(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (e) {
+      showStorageWarning();
+      return false;
+    }
+  },
+};
+function showStorageWarning() { const el = $('#storageWarn'); if (el) el.hidden = false; }
+
+// All measured data. `trials` = every single trial; `thresholds` = every finished staircase.
+let data = { trials: [], thresholds: [] };
+function loadData() {
+  const d = Store.load(DATA_KEY, null);
+  if (d && Array.isArray(d.trials) && Array.isArray(d.thresholds)) data = d;
+}
+function saveData() { Store.save(DATA_KEY, data); }
+
+/* =====================================================================
+   4. AUDIO ENGINE (Web Audio API)
+
+   Level convention: "dBFS" = level of a sine wave relative to a full-scale
+   sine, i.e. a tone at -30 dBFS has peak amplitude 10^(-30/20) = 0.0316.
+   The narrowband noise is scaled so its RMS equals that of a sine at the
+   same dBFS value, so tone and noise maskers at "-30 dBFS" carry equal power.
+
+   Signal chain:  source → envelope gain (ramps × level) → safety limiter → speakers
+   ===================================================================== */
+const AudioEngine = (() => {
+  let ctx = null;
+  let bus = null;            // everything connects here (the safety limiter)
+  let live = [];             // currently scheduled {src, gain} pairs, so we can stop them
+  const noiseCache = new Map();
+
+  const dbToAmp = db => Math.pow(10, db / 20);
+
+  // Convert dBFS to linear amplitude, never exceeding the safety cap.
+  function safeAmp(db) {
+    if (!Number.isFinite(db)) return 0;
+    if (db > SAFETY_CAP_DBFS) {
+      console.warn(`Requested ${db} dBFS, clamped to safety cap ${SAFETY_CAP_DBFS} dBFS`);
+      db = SAFETY_CAP_DBFS;
+    }
+    return dbToAmp(db);
+  }
+
+  // Create the AudioContext on first use (browsers require a click first).
+  function ensure() {
+    if (!ctx) {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // Safety limiter: a WaveShaper whose transfer curve is the identity line
+      // for |x| < cap and flat beyond it. Normal stimuli never reach it; it only
+      // guarantees that no output sample can ever exceed -10 dBFS.
+      const limiter = ctx.createWaveShaper();
+      const n = 8193, cap = dbToAmp(SAFETY_CAP_DBFS), curve = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const x = -1 + (2 * i) / (n - 1);
+        curve[i] = clamp(x, -cap, cap);
+      }
+      limiter.curve = curve;
+      limiter.oversample = 'none';
+      limiter.connect(ctx.destination);
+      bus = limiter;
+    }
+    if (ctx.state === 'suspended') ctx.resume();
+    return ctx;
+  }
+
+  // 20 ms raised-cosine (Hann-shaped) onset and offset ramps, scaled by the
+  // target amplitude. Gain starts at 0, rises over RAMP_DUR, holds, then falls.
+  function applyEnvelope(param, t0, dur, amp) {
+    const N = 128;
+    const up = new Float32Array(N), down = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const w = 0.5 * (1 - Math.cos(Math.PI * i / (N - 1)));   // 0 → 1
+      up[i] = amp * w;
+      down[i] = amp * (1 - w);                                  // 1 → 0
+    }
+    param.value = 0;
+    param.setValueCurveAtTime(up, t0, RAMP_DUR);
+    param.setValueCurveAtTime(down, t0 + dur - RAMP_DUR, RAMP_DUR);
+  }
+
+  function scheduleTone(freq, db, t0, dur) {
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    const g = ctx.createGain();
+    applyEnvelope(g.gain, t0, dur, safeAmp(db));
+    osc.connect(g).connect(bus);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.02);
+    live.push({ src: osc, gain: g });
+  }
+
+  function scheduleNoise(fc, db, t0, dur) {
+    const buf = getNoiseBuffer(fc);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const g = ctx.createGain();
+    applyEnvelope(g.gain, t0, dur, safeAmp(db));
+    src.connect(g).connect(bus);
+    // Play a random segment of the long noise buffer so every trial gets fresh noise.
+    const maxOffset = Math.max(0, buf.duration - dur - 0.05);
+    src.start(t0, Math.random() * maxOffset, dur + 0.02);
+    live.push({ src, gain: g });
+  }
+
+  /* Narrowband noise: Gaussian white noise, band-pass filtered in the frequency
+     domain (FFT → zero all bins outside the band → inverse FFT). The band is
+     1/3 octave wide, centred (geometrically) on fc: fc·2^(-1/6) … fc·2^(+1/6).
+     This gives an ideal, steep-sided filter, so the noise power sits exactly in
+     the intended band. The result is normalised to RMS = 1/√2 (same RMS as a
+     sine of amplitude 1), so the gain node sets its level in "sine-equivalent" dBFS. */
+  function getNoiseBuffer(fc) {
+    const key = String(fc);
+    if (noiseCache.has(key)) return noiseCache.get(key);
+    const sr = ctx.sampleRate;
+    const N = 1 << 17;                       // 131072 samples ≈ 2.7 s at 48 kHz
+    const re = new Float64Array(N), im = new Float64Array(N);
+    for (let i = 0; i < N; i += 2) {         // Box–Muller Gaussian white noise
+      const u1 = Math.random() || 1e-12, u2 = Math.random();
+      const r = Math.sqrt(-2 * Math.log(u1));
+      re[i] = r * Math.cos(2 * Math.PI * u2);
+      re[i + 1] = r * Math.sin(2 * Math.PI * u2);
+    }
+    fft(re, im, false);
+    const k1 = Math.ceil(fc * Math.pow(2, -1 / 6) * N / sr);
+    const k2 = Math.floor(fc * Math.pow(2, 1 / 6) * N / sr);
+    for (let k = 0; k < N; k++) {
+      const inBand = (k >= k1 && k <= k2) || (k >= N - k2 && k <= N - k1);   // keep ± frequency bins
+      if (!inBand) { re[k] = 0; im[k] = 0; }
+    }
+    fft(re, im, true);
+    let ss = 0;
+    for (let i = 0; i < N; i++) ss += re[i] * re[i];
+    const scale = (1 / Math.SQRT2) / Math.sqrt(ss / N);
+    const buf = ctx.createBuffer(1, N, sr);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < N; i++) ch[i] = re[i] * scale;
+    noiseCache.set(key, buf);
+    return buf;
+  }
+
+  // In-place iterative radix-2 complex FFT (inverse = true for the inverse transform).
+  function fft(re, im, inverse) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {     // bit-reversal permutation
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = (2 * Math.PI / len) * (inverse ? 1 : -1);
+      const wr = Math.cos(ang), wi = Math.sin(ang), half = len >> 1;
+      for (let i = 0; i < n; i += len) {
+        let cr = 1, ci = 0;
+        for (let j = 0; j < half; j++) {
+          const a = i + j, b = a + half;
+          const br = re[b] * cr - im[b] * ci, bi = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - br; im[b] = im[a] - bi;
+          re[a] += br; im[a] += bi;
+          const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+        }
+      }
+    }
+    if (inverse) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+  }
+
+  // One observation interval: masker (500 ms) and/or probe (300 ms, centred).
+  function scheduleInterval(spec, t0) {
+    if (spec.maskerOn) {
+      (spec.maskerType === 'noise' ? scheduleNoise : scheduleTone)(spec.maskerFreq, spec.maskerLevel, t0, MASKER_DUR);
+    }
+    if (spec.probeOn) scheduleTone(spec.probeFreq, spec.probeLevel, t0 + PROBE_DELAY, PROBE_DUR);
+  }
+
+  // Fade out anything still playing (5 ms) instead of cutting it, to avoid clicks.
+  function stopAll() {
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    for (const { src, gain } of live) {
+      try {
+        if (gain.gain.cancelAndHoldAtTime) gain.gain.cancelAndHoldAtTime(now);
+        else gain.gain.cancelScheduledValues(now);
+        gain.gain.setTargetAtTime(0, now, 0.005);
+        src.stop(now + 0.06);
+      } catch (e) { /* already stopped */ }
+    }
+    live = [];
+  }
+
+  // Public: single interval (Method B, manual trials). Returns timing in ms from now.
+  function playTrial(spec) {
+    ensure(); stopAll();
+    if (spec.maskerOn && spec.maskerType === 'noise') getNoiseBuffer(spec.maskerFreq);  // build before timing
+    const t0 = ctx.currentTime + 0.08;
+    scheduleInterval(spec, t0);
+    const lead = (t0 - ctx.currentTime) * 1000;
+    return { startsMs: [lead], durMs: MASKER_DUR * 1000, endMs: lead + MASKER_DUR * 1000 };
+  }
+
+  // Public: two intervals separated by 400 ms of silence (Method C).
+  function play2IFC(specs) {
+    ensure(); stopAll();
+    if (specs[0].maskerOn && specs[0].maskerType === 'noise') getNoiseBuffer(specs[0].maskerFreq);
+    const t1 = ctx.currentTime + 0.1;
+    const t2 = t1 + MASKER_DUR + ISI_2IFC;
+    scheduleInterval(specs[0], t1);
+    scheduleInterval(specs[1], t2);
+    const now = ctx.currentTime;
+    return { startsMs: [(t1 - now) * 1000, (t2 - now) * 1000], durMs: MASKER_DUR * 1000, endMs: (t2 + MASKER_DUR - now) * 1000 };
+  }
+
+  // Public: comfort check — masker alone for `dur` seconds.
+  function playMaskerAlone(m, dur = 2) {
+    ensure(); stopAll();
+    const t0 = ctx.currentTime + 0.08;
+    if (m.maskerType === 'noise') { getNoiseBuffer(m.maskerFreq); scheduleNoise(m.maskerFreq, m.maskerLevel, ctx.currentTime + 0.08, dur); }
+    else scheduleTone(m.maskerFreq, m.maskerLevel, t0, dur);
+  }
+
+  // Public: the loudest thing the app can ever play (1 kHz at the safety cap).
+  function playLoudCheck() {
+    ensure(); stopAll();
+    scheduleTone(1000, SAFETY_CAP_DBFS, ctx.currentTime + 0.08, 1.0);
+  }
+
+  function warmNoise(fc) { if (ctx) getNoiseBuffer(fc); }
+
+  return { ensure, playTrial, play2IFC, playMaskerAlone, playLoudCheck, stopAll, warmNoise };
+})();
+
+/* =====================================================================
+   5. STAIRCASE
+
+   rule '1u1d' (Method B): positive answer ("heard") → down one step,
+                           negative ("not heard") → up one step.
+   rule '2d1u' (Method C): two positive ("correct") answers in a row → down,
+                           one negative ("incorrect") → up.  Targets 70.7 % correct.
+   A reversal is a change in the direction of level changes. The level recorded
+   for a reversal is the level of the trial whose answer caused the turn-around.
+   ===================================================================== */
+class Staircase {
+  constructor(rule, opts = STAIRCASE) {
+    this.rule = rule;
+    this.opts = opts;
+    this.level = opts.startLevel;
+    this.reversals = [];      // levels at which reversals happened
+    this.lastDir = 0;         // -1 = last change was down, +1 = up, 0 = none yet
+    this.correctRun = 0;      // consecutive positives (for 2-down)
+    this.nTrials = 0;
+    this.ceilingHits = 0;     // how often the track wanted to go above the max level
+    this.done = false;
+    this.converged = false;
+  }
+
+  // 6 dB until the first 2 reversals have happened, 2 dB afterwards.
+  get stepSize() {
+    return this.reversals.length < this.opts.reversalsBeforeSmallStep ? this.opts.bigStep : this.opts.smallStep;
+  }
+
+  // Feed one answer; returns what happened (for the trial log and plot).
+  update(positive) {
+    const presented = this.level;
+    this.nTrials++;
+    let dir = 0;
+    if (positive) {
+      if (this.rule === '1u1d') dir = -1;
+      else if (++this.correctRun >= 2) { dir = -1; this.correctRun = 0; }
+    } else {
+      dir = +1;
+      this.correctRun = 0;
+    }
+
+    let reversal = false, step = 0;
+    if (dir !== 0) {
+      if (this.lastDir !== 0 && dir !== this.lastDir) {
+        reversal = true;
+        this.reversals.push(presented);
+      }
+      this.lastDir = dir;
+      step = this.stepSize;                          // evaluated after counting this reversal
+      let next = presented + dir * step;
+      if (next > PROBE_MAX_DBFS) { next = PROBE_MAX_DBFS; this.ceilingHits++; }
+      if (next < PROBE_MIN_DBFS) next = PROBE_MIN_DBFS;
+      this.level = next;
+    }
+
+    if (this.reversals.length >= this.opts.stopAfterReversals) { this.done = true; this.converged = true; }
+    else if (this.nTrials >= this.opts.maxTrials) { this.done = true; this.converged = false; }
+    return { presented, dir, reversal, step: dir === 0 ? 0 : step };
+  }
+
+  // Threshold = mean of the last 6 reversal levels (null if too few reversals).
+  threshold() {
+    const r = this.reversals.slice(-this.opts.averageLastN);
+    return r.length >= 2 ? mean(r) : null;
+  }
+}
+
+/* =====================================================================
+   6. RUN CONTROLLER
+
+   A "run" is one press of Start. It contains a queue of probe frequencies
+   (one for Single point, all of them in random order for Run full curve).
+   Each probe frequency gets its own staircase.
+   ===================================================================== */
+let run = null;
+const isRunning = () => !!run && !run.finished;
+
+// Timers are tracked so Pause/Abort can cancel everything that is scheduled.
+const timers = new Set();
+function later(fn, ms) {
+  const id = setTimeout(() => { timers.delete(id); fn(); }, ms);
+  timers.add(id);
+}
+function clearTimers() { timers.forEach(clearTimeout); timers.clear(); }
+
+function startRun(config, probeFreqs, randomize) {
+  if (isRunning() || !probeFreqs.length) return;
+  AudioEngine.ensure();
+  if (config.condition === 'masked' && config.maskerType === 'noise') AudioEngine.warmNoise(config.maskerFreq);
+  run = {
+    config,                                         // frozen copy of the settings for this run
+    sessionId: uid(),
+    queue: randomize ? shuffle([...probeFreqs]) : [...probeFreqs],
+    index: 0,
+    paused: false, finished: false, aborted: false,
+    needNewPoint: false,
+    activeMs: 0, activeStart: Date.now(), nextBreakAt: BREAK_INTERVAL_MS, pausedAt: null,
+    completed: [],
+  };
+  $('#breakBanner').hidden = true;
+  setStatus("Starting… Remember: don't touch your system volume.");
+  startPoint();
+}
+
+// Begin the staircase for the next probe frequency in the queue.
+function startPoint() {
+  run.needNewPoint = false;
+  run.probeFreq = run.queue[run.index];
+  run.stair = new Staircase(run.config.method === 'B' ? '1u1d' : '2d1u');
+  run.staircaseId = uid();
+  run.trialNo = 0; run.nCatch = 0; run.falseAlarms = 0;
+  run.history = [];          // for the live staircase plot
+  run.trial = null;
+  run.phase = 'between';
+  run.pointResult = null;
+  renderAll();
+  setStatus(`Probe ${fmtHz(run.probeFreq)} — get ready…`);
+  later(presentTrial, 900);
+}
+
+// Build and play one trial at the staircase's current level.
+function presentTrial() {
+  if (!isRunning() || run.paused) return;
+  const c = run.config;
+  const base = {
+    maskerOn: c.condition === 'masked',
+    maskerType: c.maskerType, maskerFreq: c.maskerFreq, maskerLevel: c.maskerLevel,
+    probeFreq: run.probeFreq, probeLevel: run.stair.level,
+  };
+  const t = { level: run.stair.level, replays: 0 };
+  if (c.method === 'B') {
+    // ~10 % catch trials (masker only), never on the first two trials
+    t.isCatch = run.trialNo >= 2 && Math.random() < CATCH_TRIAL_RATE;
+    t.spec = { ...base, probeOn: !t.isCatch };
+  } else {
+    t.isCatch = false;
+    t.probeInterval = Math.random() < 0.5 ? 1 : 2;    // random order
+    t.specs = [{ ...base, probeOn: t.probeInterval === 1 }, { ...base, probeOn: t.probeInterval === 2 }];
+  }
+  run.trial = t;
+  playCurrentTrial();
+}
+
+function playCurrentTrial() {
+  const t = run.trial;
+  run.phase = 'playing';
+  setResponseEnabled(false);
+  setFeedback('');
+  let timing;
+  if (run.config.method === 'B') {
+    timing = AudioEngine.playTrial(t.spec);
+    setStatus('Listen…');
+  } else {
+    timing = AudioEngine.play2IFC(t.specs);
+    setStatus('Listen: interval 1 … interval 2');
+    // Light up the interval boxes in sync with the sound
+    timing.startsMs.forEach((ms, i) => {
+      const el = $('#int' + (i + 1));
+      later(() => el.classList.add('lit'), ms);
+      later(() => el.classList.remove('lit'), ms + timing.durMs);
+    });
+  }
+  later(() => {
+    run.phase = 'awaiting';
+    setResponseEnabled(true);
+    setStatus(run.config.method === 'B' ? 'Did you hear the probe tone?  (H / N)' : 'Which interval had the probe?  (1 / 2)');
+  }, timing.endMs + 50);
+}
+
+function replayTrial() {
+  if (!isRunning() || run.paused || run.phase !== 'awaiting') return;
+  run.trial.replays++;
+  playCurrentTrial();
+}
+
+// Handle an answer: 'heard' / 'not heard' (Method B) or 1 / 2 (Method C).
+function respond(answer) {
+  if (!isRunning() || run.paused || run.phase !== 'awaiting') return;
+  const c = run.config, t = run.trial, st = run.stair;
+  run.phase = 'between';
+  setResponseEnabled(false);
+  run.trialNo++;
+
+  let correct, positive, upd = null, falseAlarm = false;
+  if (c.method === 'B') {
+    const heard = answer === 'heard';
+    positive = heard;
+    if (t.isCatch) {
+      // Catch trial: no probe was played. Log it, but don't move the staircase.
+      correct = !heard;
+      falseAlarm = heard;
+      run.nCatch++;
+      if (heard) run.falseAlarms++;
+    } else {
+      correct = heard;
+      upd = st.update(heard);
+    }
+  } else {
+    correct = answer === t.probeInterval;
+    positive = correct;
+    upd = st.update(correct);
+    setFeedback(correct ? '✓ Correct' : '✗ Incorrect', correct);
+    later(() => setFeedback(''), 700);
+  }
+
+  // Log every trial
+  data.trials.push({
+    id: uid(),
+    timestamp: new Date().toISOString(),
+    sessionId: run.sessionId,
+    staircaseId: run.staircaseId,
+    method: c.method,
+    condition: c.condition,
+    maskerOn: c.condition === 'masked',
+    maskerType: c.condition === 'masked' ? c.maskerType : null,
+    maskerFreq: c.condition === 'masked' ? c.maskerFreq : null,
+    maskerLevel: c.condition === 'masked' ? c.maskerLevel : null,
+    probeFreq: run.probeFreq,
+    probeLevel: t.level,
+    isCatch: !!t.isCatch,
+    probePresent: !t.isCatch,
+    probeInterval: c.method === 'C' ? t.probeInterval : null,
+    response: String(answer),
+    correct,
+    falseAlarm,
+    reversal: upd ? upd.reversal : false,
+    stepSize: upd ? upd.step : 0,
+    trialInStaircase: run.trialNo,
+    replays: t.replays,
+  });
+  saveData();
+
+  run.history.push({ n: run.trialNo, level: t.level, isCatch: !!t.isCatch, positive, reversal: upd ? upd.reversal : false });
+  run.trial = null;
+
+  if (st.done) completePoint();
+  else {
+    renderRunPanel(); renderStairPlot(); renderDataSummary();
+    later(presentTrial, c.method === 'C' ? 900 : 700);
+  }
+}
+
+// A staircase finished: store its threshold, then move on to the next probe.
+function completePoint() {
+  const c = run.config, st = run.stair;
+  const masked = c.condition === 'masked';
+  const rec = {
+    id: uid(),
+    timestamp: new Date().toISOString(),
+    sessionId: run.sessionId,
+    staircaseId: run.staircaseId,
+    method: c.method,
+    condition: c.condition,
+    maskerOn: masked,
+    maskerType: masked ? c.maskerType : null,
+    maskerFreq: masked ? c.maskerFreq : null,
+    maskerLevel: masked ? c.maskerLevel : null,
+    probeFreq: run.probeFreq,
+    threshold: st.threshold(),
+    reversalLevels: st.reversals.slice(),
+    usedReversals: st.reversals.slice(-STAIRCASE.averageLastN),
+    sdReversals: stdev(st.reversals.slice(-STAIRCASE.averageLastN)),
+    nTrials: run.trialNo,
+    nCatch: run.nCatch,
+    falseAlarms: run.falseAlarms,
+    ceilingHits: st.ceilingHits,
+    converged: st.converged,
+    refMaskerFreq: c.maskerFreq,   // which masker's probe list this came from (useful for baselines)
+  };
+  data.thresholds.push(rec);
+  saveData();
+  run.pointResult = rec;
+  run.completed.push(rec);
+  run.index++;
+  run.needNewPoint = true;
+
+  // Point the dashboard at what was just measured
+  settings.chart.method = c.method;
+  if (masked) { settings.chart.maskerType = c.maskerType; settings.chart.maskerLevel = c.maskerLevel; }
+  saveSettings();
+
+  let msg = `${fmtHz(rec.probeFreq)}: threshold ${fmtDb(rec.threshold)} dBFS`;
+  if (!rec.converged) msg += ' — did not converge (stopped after 100 trials); consider re-running';
+  setLastResult(rec);
+
+  if (run.index >= run.queue.length) finishRun();
+  else {
+    setStatus(`✓ ${msg}. Next probe in a moment…`);
+    renderAll();
+    later(startPoint, 1800);
+  }
+}
+
+function finishRun() {
+  run.finished = true;
+  run.phase = 'done';
+  setStatus(`✓ Run complete — ${run.completed.length} threshold${run.completed.length === 1 ? '' : 's'} saved.`);
+  renderAll();
+}
+
+function togglePause() {
+  if (!isRunning()) return;
+  const now = Date.now();
+  if (!run.paused) {
+    // Pause immediately: cancel the current trial (it is not logged) and stop sound.
+    run.paused = true;
+    run.activeMs += now - run.activeStart;
+    run.pausedAt = now;
+    clearTimers();
+    AudioEngine.stopAll();
+    $$('.interval').forEach(el => el.classList.remove('lit'));
+    run.trial = null;
+    run.phase = 'paused';
+    setResponseEnabled(false);
+    setFeedback('');
+    setStatus('Paused. Rest your ears; press Resume when ready.');
+  } else {
+    run.paused = false;
+    // A pause of a minute or more counts as a break: reset the reminder clock.
+    if (now - run.pausedAt >= 60 * 1000) { run.activeMs = 0; run.nextBreakAt = BREAK_INTERVAL_MS; $('#breakBanner').hidden = true; }
+    run.activeStart = now;
+    setStatus('Resuming…');
+    if (run.needNewPoint) later(startPoint, 600);
+    else later(presentTrial, 600);
+  }
+  renderRunPanel();
+}
+
+function abortRun() {
+  if (!isRunning()) return;
+  if (!confirm('Abort this run? The staircase in progress is discarded; finished points are kept.')) return;
+  clearTimers();
+  AudioEngine.stopAll();
+  $$('.interval').forEach(el => el.classList.remove('lit'));
+  run.finished = true;
+  run.aborted = true;
+  run.phase = 'done';
+  setStatus(`Run aborted. ${run.completed.length} finished point${run.completed.length === 1 ? '' : 's'} kept.`);
+  renderAll();
+}
+
+// Listening-time clock and the 10-minute break reminder.
+setInterval(() => {
+  if (!isRunning()) { $('#elapsed').textContent = ''; return; }
+  const active = run.activeMs + (run.paused ? 0 : Date.now() - run.activeStart);
+  $('#elapsed').textContent = `Listening since last break ${fmtTime(active)}`;
+  if (!run.paused && active >= run.nextBreakAt) {
+    $('#breakBanner').hidden = false;
+    run.nextBreakAt += BREAK_INTERVAL_MS;
+  }
+}, 1000);
+
+/* ---------- Run panel UI helpers ---------- */
+function setStatus(text) { $('#runStatus').textContent = text; }
+function setFeedback(text, good) {
+  const el = $('#feedback');
+  el.textContent = text;
+  el.className = 'feedback' + (text ? (good ? ' good' : ' bad') : '');
+}
+function setResponseEnabled(on) {
+  ['#heardBtn', '#notHeardBtn', '#int1', '#int2', '#replayBtn'].forEach(s => { $(s).disabled = !on; });
+}
+function setLastResult(rec) {
+  if (!rec) { $('#lastResult').textContent = ''; return; }
+  const parts = [`Last point: ${fmtHz(rec.probeFreq)} → ${fmtDb(rec.threshold)} dBFS`,
+    `mean of reversals ${rec.usedReversals.map(v => fmtDb(v, 0)).join(', ')}`,
+    `${rec.nTrials} trials`];
+  if (rec.method === 'B') {
+    parts.push(`catch trials ${rec.nCatch}, false “heard” ${rec.falseAlarms}`);
+    if (rec.nCatch >= 3 && rec.falseAlarms / rec.nCatch > 0.2) parts.push('⚠ high false-alarm rate — try to be stricter about “heard”');
+  }
+  if (!rec.converged) parts.push('⚠ did not converge');
+  $('#lastResult').textContent = parts.join(' · ');
+}
+
+/* =====================================================================
+   7. MANUAL TRIALS (Part 1)
+   ===================================================================== */
+let manualPending = null;   // the stimulus of the last manual trial, waiting for an answer
+
+function manualSpec() {
+  return {
+    maskerOn: $('#maskerOn').checked,
+    ...getMaskerConfig(),
+    probeOn: true,
+    probeFreq: clamp(Math.round(+$('#probeFreq').value || 1000), 100, 10000),
+    probeLevel: clamp(+$('#probeLevel').value, PROBE_MIN_DBFS, PROBE_MAX_DBFS),
+  };
+}
+
+function playManual() {
+  if (isRunning()) return;
+  const spec = manualSpec();
+  manualPending = spec;
+  AudioEngine.playTrial(spec);
+  $('#manHeardBtn').disabled = false;
+  $('#manNotBtn').disabled = false;
+}
+
+function respondManual(response) {
+  if (!manualPending || isRunning()) return;
+  const s = manualPending;
+  data.trials.push({
+    id: uid(), timestamp: new Date().toISOString(), sessionId: null, staircaseId: null,
+    method: 'manual', condition: s.maskerOn ? 'masked' : 'baseline',
+    maskerOn: s.maskerOn,
+    maskerType: s.maskerOn ? s.maskerType : null,
+    maskerFreq: s.maskerOn ? s.maskerFreq : null,
+    maskerLevel: s.maskerOn ? s.maskerLevel : null,
+    probeFreq: s.probeFreq, probeLevel: s.probeLevel,
+    isCatch: false, probePresent: true, probeInterval: null,
+    response, correct: null, falseAlarm: false, reversal: false, stepSize: 0, trialInStaircase: null, replays: 0,
+  });
+  saveData();
+  manualPending = null;
+  $('#manHeardBtn').disabled = true;
+  $('#manNotBtn').disabled = true;
+  renderManualLog();
+  renderDataSummary();
+}
+
+function renderManualLog() {
+  const items = data.trials.filter(t => t.method === 'manual').slice(-6).reverse();
+  $('#manualLog').innerHTML = items.map(t =>
+    `<li>${esc(fmtHz(t.probeFreq))} @ ${esc(fmtDb(t.probeLevel, 0))} dBFS · ${t.maskerOn ? `masker ${esc(fmtHz(t.maskerFreq))} ${esc(fmtDb(t.maskerLevel, 0))} dBFS` : 'no masker'} → <b>${esc(t.response)}</b></li>`
+  ).join('');
+}
+
+/* =====================================================================
+   8. AGGREGATION
+
+   Thresholds are grouped by condition. Masked groups: method + masker
+   type/frequency/level + probe frequency. Baseline groups: method + probe
+   frequency. Repeats inside a group are averaged.
+   Masking amount = mean masked threshold − mean baseline threshold
+   (same method, same probe frequency).
+   ===================================================================== */
+function groupKey(t) {
+  return t.condition === 'baseline'
+    ? ['baseline', t.method, t.probeFreq].join('|')
+    : ['masked', t.method, t.maskerType, t.maskerFreq, t.maskerLevel, t.probeFreq].join('|');
+}
+
+function aggregate() {
+  const map = new Map();
+  for (const t of data.thresholds) {
+    const key = groupKey(t);
+    let g = map.get(key);
+    if (!g) {
+      g = { key, condition: t.condition, method: t.method, maskerType: t.maskerType, maskerFreq: t.maskerFreq,
+        maskerLevel: t.maskerLevel, probeFreq: t.probeFreq, values: [], records: [], nFailed: 0 };
+      map.set(key, g);
+    }
+    g.records.push(t);
+    if (t.converged && Number.isFinite(t.threshold)) g.values.push(t.threshold);
+    else g.nFailed++;
+  }
+  for (const g of map.values()) {
+    g.n = g.values.length;
+    g.mean = g.n ? mean(g.values) : null;
+    g.sd = stdev(g.values);
+  }
+  return [...map.values()];
+}
+
+// Groups that match the dashboard filters, plus the matching baseline lookup.
+function filteredGroups() {
+  const f = settings.chart;
+  const groups = aggregate();
+  const masked = groups.filter(g => g.condition === 'masked' && g.method === f.method &&
+    g.maskerType === f.maskerType && g.maskerLevel === f.maskerLevel);
+  const baseline = groups.filter(g => g.condition === 'baseline' && g.method === f.method);
+  const baseMap = new Map(baseline.filter(g => g.n).map(g => [g.probeFreq, g]));
+  return { masked, baseline, baseMap };
+}
+
+/* Colour follows the masker frequency (never its rank), so a curve keeps its
+   colour whatever else is on the chart. 500/1k/2k/4k Hz have fixed slots. */
+const FIXED_SLOTS = { 500: 1, 1000: 2, 2000: 3, 4000: 4 };
+function seriesSlot(mf) {
+  if (FIXED_SLOTS[mf]) return FIXED_SLOTS[mf];
+  const customs = [...new Set(data.thresholds.filter(t => t.condition === 'masked' && !FIXED_SLOTS[t.maskerFreq]).map(t => t.maskerFreq))].sort((a, b) => a - b);
+  const i = Math.max(0, customs.indexOf(mf));
+  return 5 + (i % 4);
+}
+const seriesColor = mf => `var(--s${seriesSlot(mf)})`;
+
+/* =====================================================================
+   9. CHARTS — plain SVG, drawn from scratch so the file works offline
+   ===================================================================== */
+const OCTAVE_TICKS = [31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+const THIRD_TICKS = [50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000];
+const tickLabel = v => v >= 1000 ? (v / 1000) + 'k' : String(v);
+
+function niceYAxis(lo, hi, minSpan) {
+  if (hi - lo < minSpan) { const c = (hi + lo) / 2; lo = c - minSpan / 2; hi = c + minSpan / 2; }
+  const span = hi - lo;
+  const step = span > 60 ? 10 : span > 24 ? 5 : 2;
+  lo = Math.floor(lo / step) * step;
+  hi = Math.ceil(hi / step) * step;
+  const ticks = [];
+  for (let v = lo; v <= hi + 1e-9; v += step) ticks.push(v);
+  return { lo, hi, ticks };
+}
+
+// Build the curves to draw from the stored thresholds and the filters.
+function buildCurveData() {
+  const f = settings.chart;
+  const { masked, baseline, baseMap } = filteredGroups();
+  const byMasker = new Map();
+  for (const g of masked) {
+    if (!byMasker.has(g.maskerFreq)) byMasker.set(g.maskerFreq, []);
+    byMasker.get(g.maskerFreq).push(g);
+  }
+  let missingBaseline = 0;
+  const series = [...byMasker.entries()].sort((a, b) => a[0] - b[0]).map(([mf, gs]) => {
+    const points = gs.filter(g => g.n).sort((a, b) => a.probeFreq - b.probeFreq).map(g => {
+      const b = baseMap.get(g.probeFreq);
+      let y, err;
+      if (f.yMode === 'threshold') { y = g.mean; err = g.sd; }
+      else {
+        if (!b) { missingBaseline++; return null; }
+        y = g.mean - b.mean;
+        err = (g.sd != null || b.sd != null) ? Math.sqrt((g.sd || 0) ** 2 + (b.sd || 0) ** 2) : null;
+      }
+      const tip = `<b>Masker ${esc(fmtHz(mf))}</b> · probe ${esc(g.probeFreq)} Hz (×${esc((g.probeFreq / mf).toFixed(2))})<br>` +
+        `Masked threshold: ${esc(fmtDb(g.mean))} dBFS${g.sd != null ? ` (SD ${esc(g.sd.toFixed(1))})` : ''}<br>` +
+        `Baseline: ${b ? esc(fmtDb(b.mean)) + ' dBFS' : '—'}<br>` +
+        `Masking: ${b ? esc(fmtDb(g.mean - b.mean)) + ' dB' : '— (no baseline yet)'}<br>` +
+        `Repeats: ${g.n}${g.nFailed ? ` (+${g.nFailed} not converged)` : ''}`;
+      return { x: g.probeFreq, y, err, n: g.n, tip };
+    }).filter(Boolean);
+    return { mf, color: seriesColor(mf), points };
+  });
+  let base = null;
+  if (f.showBaseline && f.yMode === 'threshold') {
+    base = baseline.filter(g => g.n).sort((a, b) => a.probeFreq - b.probeFreq).map(g => ({
+      x: g.probeFreq, y: g.mean, err: g.sd, n: g.n,
+      tip: `<b>Baseline (no masker)</b> · probe ${esc(g.probeFreq)} Hz<br>Threshold: ${esc(fmtDb(g.mean))} dBFS${g.sd != null ? ` (SD ${esc(g.sd.toFixed(1))})` : ''}<br>Repeats: ${g.n}`,
+    }));
+  }
+  return { series, base, missingBaseline };
+}
+
+function renderCurveChart() {
+  const box = $('#curveChart');
+  const W = Math.max(300, Math.floor(box.clientWidth || 700));
+  const H = Math.round(clamp(W * 0.5, 280, 440));
+  const f = settings.chart;
+  const M = { l: 52, r: 18, t: 36, b: 46 };
+  const pw = W - M.l - M.r, ph = H - M.t - M.b;
+  const { series, base, missingBaseline } = buildCurveData();
+
+  // ---- x domain (log) ----
+  const xs = [];
+  series.forEach(s => { xs.push(s.mf); s.points.forEach(p => xs.push(p.x)); });
+  (base || []).forEach(p => xs.push(p.x));
+  let xLo = xs.length ? Math.min(...xs) / 1.3 : 200, xHi = xs.length ? Math.max(...xs) * 1.3 : 10000;
+  if (xHi / xLo < 6) { const c = Math.sqrt(xHi * xLo); xLo = c / Math.sqrt(6); xHi = c * Math.sqrt(6); }
+  const lx0 = Math.log(xLo), lx1 = Math.log(xHi);
+  const X = v => M.l + (Math.log(v) - lx0) / (lx1 - lx0) * pw;
+  let xt = OCTAVE_TICKS.filter(v => v >= xLo && v <= xHi);
+  if (xt.length < 4) xt = THIRD_TICKS.filter(v => v >= xLo && v <= xHi);
+  // thin ticks that would collide
+  const xTicks = []; let lastX = -Infinity;
+  for (const v of xt) { const px = X(v); if (px - lastX >= 34) { xTicks.push(v); lastX = px; } }
+
+  // ---- y domain ----
+  const ys = [];
+  series.forEach(s => s.points.forEach(p => { ys.push(p.y + (p.err || 0), p.y - (p.err || 0)); }));
+  (base || []).forEach(p => ys.push(p.y + (p.err || 0), p.y - (p.err || 0)));
+  if (f.yMode === 'masking') ys.push(0);
+  let yr;
+  if (ys.length) yr = niceYAxis(Math.min(...ys) - 3, Math.max(...ys) + 3, 20);
+  else yr = f.yMode === 'threshold' ? niceYAxis(-80, -20, 20) : niceYAxis(-5, 30, 20);
+  const Y = v => M.t + (yr.hi - v) / (yr.hi - yr.lo) * ph;
+
+  let s = '';
+  // gridlines + y labels
+  for (const v of yr.ticks) {
+    s += `<line class="grid" x1="${M.l}" x2="${M.l + pw}" y1="${Y(v)}" y2="${Y(v)}"/>`;
+    s += `<text class="tick" x="${M.l - 8}" y="${Y(v) + 4}" text-anchor="end">${esc(fmtDb(v, 0))}</text>`;
+  }
+  for (const v of xTicks) {
+    s += `<line class="grid" x1="${X(v)}" x2="${X(v)}" y1="${M.t}" y2="${M.t + ph}" style="stroke-dasharray:2 3"/>`;
+    s += `<text class="tick" x="${X(v)}" y="${M.t + ph + 16}" text-anchor="middle">${esc(tickLabel(v))}</text>`;
+  }
+  s += `<line class="base" x1="${M.l}" x2="${M.l + pw}" y1="${M.t + ph}" y2="${M.t + ph}"/>`;
+  s += `<text class="axis-title" x="${M.l + pw / 2}" y="${H - 6}" text-anchor="middle">Probe frequency (Hz, log scale)</text>`;
+  s += `<text class="axis-title" transform="translate(13 ${M.t + ph / 2}) rotate(-90)" text-anchor="middle">${f.yMode === 'threshold' ? 'Threshold (dBFS)' : 'Masking amount (dB)'}</text>`;
+
+  // zero line for the masking view
+  if (f.yMode === 'masking' && 0 >= yr.lo && 0 <= yr.hi) {
+    s += `<line x1="${M.l}" x2="${M.l + pw}" y1="${Y(0)}" y2="${Y(0)}" style="stroke:var(--ink-2);stroke-width:1.2"/>`;
+    s += `<text class="tick" x="${M.l + pw - 4}" y="${Y(0) - 5}" text-anchor="end">no masking</text>`;
+  }
+
+  // vertical dashed line + label at each masker frequency (two label rows to avoid overlap)
+  let lastLabelX = [-Infinity, -Infinity];
+  for (const sr of series) {
+    const px = X(sr.mf);
+    s += `<line x1="${px}" x2="${px}" y1="${M.t}" y2="${M.t + ph}" style="stroke:${sr.color};stroke-width:1.5;stroke-dasharray:6 4;opacity:.85"/>`;
+    const row = px - lastLabelX[0] >= 64 ? 0 : 1;
+    lastLabelX[row] = px;
+    s += `<text class="ink2 halo" x="${px}" y="${M.t - 8 - row * 13}" text-anchor="middle" style="font-weight:600">M ${esc(fmtHz(sr.mf))}</text>`;
+  }
+
+  // helpers for marks
+  const errBar = (p, color) => {
+    if (!(p.n > 1 || f.yMode === 'masking') || !p.err) return '';
+    const x = X(p.x), y1 = Y(p.y - p.err), y2 = Y(p.y + p.err);
+    return `<path d="M${x},${y1}V${y2}M${x - 4},${y1}H${x + 4}M${x - 4},${y2}H${x + 4}" style="stroke:${color};stroke-width:1.5;fill:none;opacity:.8"/>`;
+  };
+  const linePath = pts => pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.x).toFixed(1)},${Y(p.y).toFixed(1)}`).join('');
+
+  // baseline curve (threshold in quiet): grey, dashed, hollow markers
+  let hits = '';
+  if (base && base.length) {
+    s += base.map(p => errBar(p, 'var(--ink-2)')).join('');
+    if (base.length > 1) s += `<path d="${linePath(base)}" style="fill:none;stroke:var(--ink-2);stroke-width:2;stroke-dasharray:6 4"/>`;
+    for (const p of base) {
+      s += `<circle cx="${X(p.x)}" cy="${Y(p.y)}" r="4" style="fill:var(--surface);stroke:var(--ink-2);stroke-width:2"/>`;
+      hits += `<circle class="hit" cx="${X(p.x)}" cy="${Y(p.y)}" r="11" data-tip="${esc(p.tip)}"/>`;
+    }
+  }
+
+  // masked curves
+  for (const sr of series) {
+    if (!sr.points.length) continue;
+    s += sr.points.map(p => errBar(p, sr.color)).join('');
+    if (sr.points.length > 1) s += `<path d="${linePath(sr.points)}" style="fill:none;stroke:${sr.color};stroke-width:2;stroke-linejoin:round"/>`;
+    for (const p of sr.points) {
+      s += `<circle cx="${X(p.x)}" cy="${Y(p.y)}" r="4.5" style="fill:${sr.color};stroke:var(--surface);stroke-width:2"/>`;
+      hits += `<circle class="hit" cx="${X(p.x)}" cy="${Y(p.y)}" r="11" data-tip="${esc(p.tip)}"/>`;
+    }
+  }
+  if (!series.some(sr => sr.points.length) && !(base && base.length)) {
+    s += `<text class="empty" x="${M.l + pw / 2}" y="${M.t + ph / 2}" text-anchor="middle">${f.yMode === 'masking'
+      ? 'Needs both a masked and a baseline threshold at the same probe frequency'
+      : 'No thresholds yet for this selection — run a measurement'}</text>`;
+  }
+  s += hits;   // invisible, larger hover targets on top
+
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc($('#chartTitle').textContent)}">${s}</svg>`;
+
+  // legend (always present when there is more than one thing to tell apart)
+  const sw = (color, dashed, hollow) => `<svg width="26" height="12" aria-hidden="true"><line x1="1" x2="25" y1="6" y2="6" style="stroke:${color};stroke-width:2${dashed ? ';stroke-dasharray:5 3' : ''}"/><circle cx="13" cy="6" r="3.5" style="fill:${hollow ? 'var(--surface)' : color};stroke:${hollow ? color : 'var(--surface)'};stroke-width:${hollow ? 2 : 1.5}"/></svg>`;
+  let leg = series.map(sr => `<span>${sw(sr.color)}Masker ${esc(fmtHz(sr.mf))}</span>`).join('');
+  if (base && base.length) leg += `<span>${sw('var(--ink-2)', true, true)}Baseline (threshold in quiet)</span>`;
+  if (series.length) leg += `<span><svg width="14" height="14" aria-hidden="true"><line x1="7" x2="7" y1="0" y2="14" style="stroke:var(--ink-2);stroke-width:1.5;stroke-dasharray:3 2"/></svg>Masker frequency</span>`;
+  $('#curveLegend').innerHTML = leg;
+
+  // caption — written so a screenshot is self-explanatory
+  const nPts = series.reduce((a, sr) => a + sr.points.length, 0);
+  let cap = `${METHOD_LABEL[f.method]} · ${TYPE_LABEL[f.maskerType]} masker at ${fmtDb(f.maskerLevel, 0)} dBFS · ${nPts} point${nPts === 1 ? '' : 's'}. ` +
+    `Each point = mean threshold across repeats; error bars = ±1 SD (shown when there are ≥ 2 repeats). `;
+  if (f.yMode === 'masking') cap += `Masking amount = masked threshold − baseline threshold at the same probe frequency (same method). `;
+  if (missingBaseline) cap += `${missingBaseline} masked point${missingBaseline === 1 ? ' is' : 's are'} hidden because no baseline exists yet. `;
+  cap += 'Levels in dBFS — system uncalibrated.';
+  $('#chartCaption').textContent = cap;
+}
+
+// Live staircase: trial number vs probe level, reversals highlighted.
+function renderStairPlot() {
+  const box = $('#stairChart');
+  const W = Math.max(300, Math.floor(box.clientWidth || 600));
+  const H = 210;
+  const M = { l: 52, r: 14, t: 14, b: 34 };
+  const pw = W - M.l - M.r, ph = H - M.t - M.b;
+  const hist = run && run.history ? run.history : [];
+  const real = hist.filter(h => !h.isCatch);
+  const thr = run && run.pointResult && run.needNewPoint !== undefined && run.pointResult.staircaseId === run.staircaseId ? run.pointResult.threshold : null;
+
+  const levels = real.map(h => h.level).concat(run && run.stair ? [run.stair.level] : [STAIRCASE.startLevel]);
+  if (thr != null) levels.push(thr);
+  const yr = niceYAxis(Math.max(PROBE_MIN_DBFS - 5, Math.min(...levels) - 4), Math.min(-5, Math.max(...levels) + 4), 20);
+  const nMax = Math.max(12, hist.length + 2);
+  const X = n => M.l + (n - 0.5) / nMax * pw;
+  const Y = v => M.t + (yr.hi - v) / (yr.hi - yr.lo) * ph;
+
+  let s = '';
+  for (const v of yr.ticks) {
+    s += `<line class="grid" x1="${M.l}" x2="${M.l + pw}" y1="${Y(v)}" y2="${Y(v)}"/>`;
+    s += `<text class="tick" x="${M.l - 8}" y="${Y(v) + 4}" text-anchor="end">${esc(fmtDb(v, 0))}</text>`;
+  }
+  const xStep = nMax > 60 ? 10 : nMax > 24 ? 5 : 2;
+  for (let n = xStep; n <= nMax; n += xStep) s += `<text class="tick" x="${X(n)}" y="${M.t + ph + 15}" text-anchor="middle">${n}</text>`;
+  s += `<line class="base" x1="${M.l}" x2="${M.l + pw}" y1="${M.t + ph}" y2="${M.t + ph}"/>`;
+  s += `<text class="axis-title" x="${M.l + pw / 2}" y="${H - 4}" text-anchor="middle">Trial number</text>`;
+  s += `<text class="axis-title" transform="translate(13 ${M.t + ph / 2}) rotate(-90)" text-anchor="middle">Probe level (dBFS)</text>`;
+
+  if (thr != null) {
+    s += `<line x1="${M.l}" x2="${M.l + pw}" y1="${Y(thr)}" y2="${Y(thr)}" style="stroke:var(--ink);stroke-width:1.5;stroke-dasharray:6 4"/>`;
+    s += `<text class="ink halo" x="${M.l + pw - 4}" y="${Y(thr) + 16}" text-anchor="end" style="font-weight:600">threshold ${esc(fmtDb(thr))} dBFS</text>`;
+  }
+  if (real.length > 1) {
+    s += `<path d="${real.map((h, i) => `${i ? 'L' : 'M'}${X(h.n)},${Y(h.level)}`).join('')}" style="fill:none;stroke:var(--s1);stroke-width:1.5;opacity:.7"/>`;
+  }
+  let hits = '';
+  for (const h of hist) {
+    const x = X(h.n);
+    if (h.isCatch) {
+      const y = M.t + 8;
+      s += `<path d="M${x - 4},${y - 4}L${x + 4},${y + 4}M${x - 4},${y + 4}L${x + 4},${y - 4}" style="stroke:${h.positive ? 'var(--bad)' : 'var(--muted)'};stroke-width:2"/>`;
+      hits += `<circle class="hit" cx="${x}" cy="${y}" r="9" data-tip="${esc(`Trial ${h.n} · catch trial (no probe)<br>Answer: ${h.positive ? '<b>heard</b> (false alarm)' : 'not heard ✓'}`)}"/>`;
+      continue;
+    }
+    const y = Y(h.level);
+    if (h.reversal) s += `<circle cx="${x}" cy="${y}" r="8" style="fill:none;stroke:var(--s2);stroke-width:2.5"/>`;
+    s += `<circle cx="${x}" cy="${y}" r="4.5" style="fill:${h.positive ? 'var(--s1)' : 'var(--surface)'};stroke:var(--s1);stroke-width:2"/>`;
+    const ans = run && run.config.method === 'C' ? (h.positive ? 'correct' : 'incorrect') : (h.positive ? 'heard' : 'not heard');
+    hits += `<circle class="hit" cx="${x}" cy="${y}" r="10" data-tip="${esc(`Trial ${h.n} · ${fmtDb(h.level, 0)} dBFS<br>Answer: ${ans}${h.reversal ? '<br><b>Reversal</b>' : ''}`)}"/>`;
+  }
+  if (!hist.length) {
+    s += `<text class="empty" x="${M.l + pw / 2}" y="${M.t + ph / 2}" text-anchor="middle">The staircase for the current run will appear here</text>`;
+  }
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Live staircase plot">${s}${hits}</svg>`;
+
+  const isC = run ? run.config.method === 'C' : settings.method === 'C';
+  $('#stairLegend').innerHTML =
+    `<span><svg width="12" height="12"><circle cx="6" cy="6" r="4" style="fill:var(--s1);stroke:var(--s1);stroke-width:2"/></svg>${isC ? 'correct' : 'heard'}</span>` +
+    `<span><svg width="12" height="12"><circle cx="6" cy="6" r="4" style="fill:var(--surface);stroke:var(--s1);stroke-width:2"/></svg>${isC ? 'incorrect' : 'not heard'}</span>` +
+    `<span><svg width="18" height="18"><circle cx="9" cy="9" r="7" style="fill:none;stroke:var(--s2);stroke-width:2.5"/></svg>reversal</span>` +
+    (isC ? '' : `<span><svg width="12" height="12"><path d="M2,2L10,10M2,10L10,2" style="stroke:var(--muted);stroke-width:2"/></svg>catch trial (red = false “heard”)</span>`) +
+    `<span><svg width="22" height="10"><line x1="0" x2="22" y1="5" y2="5" style="stroke:var(--ink);stroke-width:1.5;stroke-dasharray:5 3"/></svg>threshold</span>`;
+}
+
+/* =====================================================================
+   10. RESULTS TABLE, DATA EXPORT / IMPORT
+   ===================================================================== */
+function renderTable() {
+  const f = settings.chart;
+  const { masked, baseline, baseMap } = filteredGroups();
+  masked.sort((a, b) => a.maskerFreq - b.maskerFreq || a.probeFreq - b.probeFreq);
+  baseline.sort((a, b) => a.probeFreq - b.probeFreq);
+  const dis = isRunning() ? 'disabled' : '';
+  const nf = g => g.nFailed ? ` <span class="warnmark" title="${g.nFailed} run(s) did not converge">+${g.nFailed}✗</span>` : '';
+  const actions = g => `<td class="act"><button type="button" data-rerun="${esc(g.key)}" ${dis}>+1 repeat</button> <button type="button" data-dellast="${esc(g.key)}" ${dis} title="Delete the most recent threshold in this row">Delete last</button></td>`;
+
+  let html = `<thead><tr><th>Masker</th><th>Probe (Hz)</th><th>Probe / masker</th><th>n</th><th>Threshold (dBFS)</th><th>SD</th><th>Baseline (dBFS)</th><th>Masking (dB)</th><th></th></tr></thead><tbody>`;
+  if (masked.length) {
+    html += `<tr class="section"><td colspan="9">With masker — ${esc(TYPE_LABEL[f.maskerType])} at ${esc(fmtDb(f.maskerLevel, 0))} dBFS</td></tr>`;
+    for (const g of masked) {
+      const b = baseMap.get(g.probeFreq);
+      html += `<tr><td><span class="sw" style="background:${seriesColor(g.maskerFreq)}"></span>${esc(fmtHz(g.maskerFreq))}</td>` +
+        `<td>${esc(g.probeFreq)}</td><td>×${esc((g.probeFreq / g.maskerFreq).toFixed(2))}</td><td>${g.n}${nf(g)}</td>` +
+        `<td><b>${esc(fmtDb(g.mean))}</b></td><td>${g.sd != null ? esc(g.sd.toFixed(1)) : '—'}</td>` +
+        `<td>${b ? esc(fmtDb(b.mean)) : '—'}</td><td><b>${b && g.mean != null ? esc(fmtDb(g.mean - b.mean)) : '—'}</b></td>${actions(g)}</tr>`;
+    }
+  }
+  if (baseline.length) {
+    html += `<tr class="section"><td colspan="9">Baseline — no masker (threshold in quiet)</td></tr>`;
+    for (const g of baseline) {
+      html += `<tr><td>none</td><td>${esc(g.probeFreq)}</td><td>—</td><td>${g.n}${nf(g)}</td>` +
+        `<td><b>${esc(fmtDb(g.mean))}</b></td><td>${g.sd != null ? esc(g.sd.toFixed(1)) : '—'}</td><td>—</td><td>—</td>${actions(g)}</tr>`;
+    }
+  }
+  if (!masked.length && !baseline.length) html += `<tr><td colspan="9" style="text-align:left;color:var(--muted)">No thresholds for ${esc(METHOD_LABEL[f.method])} yet.</td></tr>`;
+  html += '</tbody>';
+  $('#resultsTable').innerHTML = html;
+  $('#tableTitle').textContent = `Results — Method ${METHOD_LABEL[f.method]}`;
+}
+
+// "+1 repeat": re-run exactly the condition of that table row
+function rerunGroup(key) {
+  const g = aggregate().find(x => x.key === key);
+  if (!g || isRunning()) return;
+  const m = getMaskerConfig();
+  const cfg = g.condition === 'masked'
+    ? { method: g.method, condition: 'masked', maskerType: g.maskerType, maskerFreq: g.maskerFreq, maskerLevel: g.maskerLevel }
+    : { method: g.method, condition: 'baseline', maskerType: m.maskerType, maskerFreq: m.maskerFreq, maskerLevel: m.maskerLevel };
+  startRun(cfg, [g.probeFreq], false);
+}
+
+function deleteLastInGroup(key) {
+  const g = aggregate().find(x => x.key === key);
+  if (!g || isRunning()) return;
+  const latest = g.records.slice().sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
+  if (!confirm(`Delete the most recent threshold for probe ${g.probeFreq} Hz (${fmtDb(latest.threshold)} dBFS, ${latest.timestamp.slice(0, 16).replace('T', ' ')})? Its trials stay in the trial log.`)) return;
+  data.thresholds = data.thresholds.filter(t => t.id !== latest.id);
+  saveData();
+  renderAll();
+}
+
+function renderDataSummary() {
+  const nT = data.trials.length, nTh = data.thresholds.length;
+  const failed = data.thresholds.filter(t => !t.converged).length;
+  const catches = data.trials.filter(t => t.isCatch);
+  const fa = catches.filter(t => t.falseAlarm).length;
+  $('#dataSummary').textContent = `Stored: ${nT} trial${nT === 1 ? '' : 's'}, ${nTh} threshold${nTh === 1 ? '' : 's'}` +
+    (failed ? ` (${failed} not converged)` : '') +
+    (catches.length ? ` · catch trials ${catches.length}, false “heard” ${fa} (${Math.round(100 * fa / catches.length)} %)` : '') + '.';
+}
+
+const TRIAL_COLS = ['timestamp', 'sessionId', 'staircaseId', 'method', 'condition', 'maskerOn', 'maskerType', 'maskerFreq', 'maskerLevel',
+  'probeFreq', 'probeLevel', 'isCatch', 'probePresent', 'probeInterval', 'response', 'correct', 'falseAlarm', 'reversal', 'stepSize', 'trialInStaircase', 'replays'];
+const THR_COLS = ['timestamp', 'sessionId', 'staircaseId', 'method', 'condition', 'maskerType', 'maskerFreq', 'maskerLevel', 'probeFreq',
+  'threshold', 'sdReversals', 'usedReversals', 'reversalLevels', 'nTrials', 'nCatch', 'falseAlarms', 'ceilingHits', 'converged', 'refMaskerFreq'];
+
+function toCSV(rows, cols) {
+  const cell = v => {
+    if (v == null) return '';
+    const s = Array.isArray(v) ? v.join(';') : String(v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  return [cols.join(','), ...rows.map(r => cols.map(c => cell(r[c])).join(','))].join('\n');
+}
+
+function download(filename, text, type) {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+const stamp = () => new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+
+// Merge an exported data object into the stored data, skipping records already present.
+function mergeData(d) {
+  if (!d || !Array.isArray(d.trials) || !Array.isArray(d.thresholds)) throw new Error('File does not contain "trials" and "thresholds" arrays.');
+  const tIds = new Set(data.trials.map(t => t.id)), hIds = new Set(data.thresholds.map(t => t.id));
+  let addT = 0, addH = 0;
+  for (const t of d.trials) { if (!t.id) t.id = uid(); if (!tIds.has(t.id)) { data.trials.push(t); addT++; } }
+  for (const t of d.thresholds) { if (!t.id) t.id = uid(); if (!hIds.has(t.id)) { data.thresholds.push(t); addH++; } }
+  data.trials.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+  data.thresholds.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+  saveData();
+  return { addT, addH };
+}
+
+function importJSON(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const { addT, addH } = mergeData(JSON.parse(reader.result));
+      renderAll();
+      alert(`Imported ${addT} trials and ${addH} thresholds (duplicates skipped).`);
+    } catch (e) {
+      alert('Import failed: ' + e.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+/* Author's data. When the page is served from a web server (GitHub Pages), it
+   can read data/masking_data.json next to it. A first-time visitor with no
+   stored data gets the author's measurements loaded automatically, so the
+   dashboard is not empty. Opened as a local file, the browser blocks this
+   request and the app starts empty as before. */
+const AUTHOR_DATA_URL = 'data/masking_data.json';
+const AUTHOR_FLAG_KEY = 'maskingCurveLab.authorDataLoaded';
+
+async function loadAuthorData(auto) {
+  try {
+    const res = await fetch(AUTHOR_DATA_URL, { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const { addT, addH } = mergeData(await res.json());
+    Store.save(AUTHOR_FLAG_KEY, true);
+    $('#authorNote').hidden = false;
+    // A first-time visitor (e.g. the grader) lands on the dashboard; "Exit report view" shows the full app.
+    if (auto) { document.body.classList.add('report'); $('#reportBtn').textContent = 'Exit report view'; }
+    renderAll();
+    if (!auto) alert(`Loaded ${addH} thresholds and ${addT} trials from the author's data (duplicates skipped).`);
+  } catch (e) {
+    if (!auto) alert(`Could not load the author's data. This works only when the page is opened online (e.g. on GitHub Pages), not as a local file.`);
+  }
+}
+
+/* =====================================================================
+   11. SETTINGS & UI WIRING
+   ===================================================================== */
+const DEFAULT_SETTINGS = {
+  maskerFreqSel: '1000', maskerFreqCustom: 1500, maskerType: 'tone', maskerLevel: -30,
+  maskerOn: true, probeFreq: 1200, probeLevel: -40,
+  method: 'B', condition: 'masked', scope: 'full', probeLists: {}, singleProbe: null,
+  chart: { yMode: 'threshold', showBaseline: true, method: 'B', maskerType: 'tone', maskerLevel: -30 },
+  theme: 'auto',
+};
+let settings = structuredClone(DEFAULT_SETTINGS);
+function loadSettings() {
+  const s = Store.load(SETTINGS_KEY, null);
+  if (s && typeof s === 'object') settings = { ...structuredClone(DEFAULT_SETTINGS), ...s, chart: { ...DEFAULT_SETTINGS.chart, ...(s.chart || {}) } };
+}
+function saveSettings() { Store.save(SETTINGS_KEY, settings); }
+
+function getMaskerFreq() {
+  if ($('#maskerFreqSel').value === 'custom') {
+    const v = parseFloat($('#maskerFreqCustom').value);
+    return Number.isFinite(v) ? Math.round(clamp(v, 50, 8000)) : 1000;
+  }
+  return +$('#maskerFreqSel').value;
+}
+function getMaskerConfig() {
+  return { maskerFreq: getMaskerFreq(), maskerType: radioVal('maskerType') || 'tone', maskerLevel: +$('#maskerLevel').value };
+}
+
+/* ---------- probe-frequency list ---------- */
+const defaultProbeList = mf => DEFAULT_RATIOS.map(r => Math.round(mf * r));
+function parseProbeList(text) {
+  const parts = text.split(/[\s,;]+/).filter(Boolean);
+  const list = [], bad = [];
+  for (const p of parts) {
+    const v = Math.round(parseFloat(p));
+    if (!Number.isFinite(v) || v < 50 || v > 16000) bad.push(p);
+    else if (!list.includes(v)) list.push(v);
+  }
+  return { list, error: bad.length ? `Ignored: ${bad.join(', ')} (must be 50–16000 Hz)` : (list.length ? '' : 'Enter at least one frequency.') };
+}
+function currentProbeList() { return parseProbeList($('#probeList').value).list; }
+
+function loadProbeListForMasker() {
+  const mf = getMaskerFreq();
+  const list = settings.probeLists[mf] || defaultProbeList(mf);
+  $('#probeList').value = list.join(', ');
+  onProbeListInput(false);
+}
+function onProbeListInput(store = true) {
+  const mf = getMaskerFreq();
+  const { list, error } = parseProbeList($('#probeList').value);
+  $('#listError').textContent = error;
+  if (store && list.length) {
+    const isDefault = list.join() === defaultProbeList(mf).join();
+    if (isDefault) delete settings.probeLists[mf]; else settings.probeLists[mf] = list;
+    saveSettings();
+  }
+  $('#listHint').textContent = `Default = masker × ${DEFAULT_RATIOS.join(', ')}. Ratios now: ${list.map(f => (f / mf).toFixed(2)).join(', ')}.`;
+  // single-point probe choices
+  const sel = $('#singleProbeSel');
+  const prev = +sel.value || settings.singleProbe;
+  sel.innerHTML = list.map(f => `<option value="${f}">${f} Hz (×${(f / mf).toFixed(2)})</option>`).join('');
+  if (list.includes(prev)) sel.value = prev;
+  updateStartLabel();
+}
+
+function updateStartLabel() {
+  const n = radioVal('scope') === 'full' ? currentProbeList().length : 1;
+  const cond = radioVal('condition') === 'baseline' ? 'baseline' : 'masked';
+  $('#startBtn').textContent = radioVal('scope') === 'full'
+    ? `Start full curve — ${cond}, ${n} point${n === 1 ? '' : 's'}`
+    : `Start single point — ${cond}`;
+  $('#singleField').hidden = radioVal('scope') !== 'single';
+}
+
+function updateMaskerHint() {
+  const type = radioVal('maskerType');
+  const lvl = $('#maskerLevel');
+  // Noise peaks are ~10 dB above its RMS, so its level is capped lower to stay clear of the limiter.
+  lvl.max = type === 'noise' ? NOISE_MASKER_MAX_DBFS : SAFETY_CAP_DBFS;
+  if (+lvl.value > +lvl.max) lvl.value = lvl.max;
+  $('#maskerLevelOut').textContent = `${fmtDb(+lvl.value, 0)} dBFS`;
+  $('#maskerHint').textContent = type === 'tone'
+    ? 'Tip: with a tone masker, probes close to the masker frequency create beats (a fluttering/roughness) that make the probe easier to detect. The narrowband-noise masker avoids this.'
+    : 'Noise = white noise band-pass filtered to ⅓ octave around the masker frequency. Its power (RMS) equals a tone at the same dBFS. Max −20 dBFS, because noise peaks are ~10 dB higher than a tone’s at the same level.';
+  updateManualHint();
+}
+
+function updateManualHint() {
+  const s = manualSpec();
+  const near = s.maskerOn && s.maskerType === 'tone' && Math.abs(s.probeFreq - s.maskerFreq) / s.maskerFreq < 0.1;
+  $('#manualHint').textContent = near ? 'Probe is within 10 % of the tone masker: listen for beats (a flutter) — that cue is why noise maskers are often preferred.' : '';
+}
+
+/* log-scale probe-frequency slider: 0…1000 ↔ 100…10000 Hz */
+const sliderToHz = v => Math.round(100 * Math.pow(100, v / 1000));
+const hzToSlider = f => Math.round(1000 * Math.log(clamp(f, 100, 10000) / 100) / Math.log(100));
+
+function renderChartFilters() {
+  const f = settings.chart;
+  setRadio('yMode', f.yMode);
+  $('#showBaseline').checked = f.showBaseline;
+  $('#showBaseline').disabled = f.yMode === 'masking';
+  $('#fMethod').value = f.method;
+  $('#fType').value = f.maskerType;
+  // masker levels that actually have data for this method + masker type
+  const levels = [...new Set(data.thresholds.filter(t => t.condition === 'masked' && t.method === f.method && t.maskerType === f.maskerType).map(t => t.maskerLevel))].sort((a, b) => b - a);
+  if (levels.length && !levels.includes(f.maskerLevel)) f.maskerLevel = levels[0];
+  const opts = levels.length ? levels : [f.maskerLevel];
+  $('#fLevel').innerHTML = opts.map(l => `<option value="${l}">${fmtDb(l, 0)} dBFS</option>`).join('');
+  $('#fLevel').value = String(f.maskerLevel);
+  $('#chartTitle').textContent = f.yMode === 'threshold'
+    ? `Masked thresholds vs probe frequency`
+    : `Amount of masking vs probe frequency`;
+}
+
+function renderRunPanel() {
+  const running = isRunning();
+  const method = run ? run.config.method : radioVal('method');
+  $('#respB').hidden = method !== 'B';
+  $('#respC').hidden = method !== 'C';
+
+  const pill = $('#runPill');
+  pill.textContent = !run ? 'Idle' : run.aborted ? 'Aborted' : run.finished ? 'Done' : run.paused ? 'Paused' : 'Running';
+  pill.className = 'pill' + (running && !run.paused ? ' running' : '');
+
+  if (!run) {
+    if (!$('#runStatus').textContent) setStatus('No measurement running. Choose settings under “Parts 2–3” and press Start.');
+    $('#runMeta').innerHTML = '';
+    $('#progBar').style.width = '0%';
+  } else {
+    const c = run.config, st = run.stair, total = run.queue.length;
+    const within = st && !run.needNewPoint ? Math.min(1, st.reversals.length / STAIRCASE.stopAfterReversals) : 0;
+    const frac = run.finished && !run.aborted ? 1 : (run.index + within) / total;
+    $('#progBar').style.width = `${(frac * 100).toFixed(1)}%`;
+    const pointNo = Math.min(run.index + (run.needNewPoint ? 0 : 1), total);
+    const meta = [
+      `Method <b>${esc(c.method === 'B' ? 'B · Yes/No' : 'C · 2IFC')}</b>`,
+      c.condition === 'masked' ? `Masker <b>${esc(fmtHz(c.maskerFreq))} ${esc(TYPE_LABEL[c.maskerType])}, ${esc(fmtDb(c.maskerLevel, 0))} dBFS</b>` : `Masker <b>off (baseline)</b>`,
+      `Point <b>${pointNo} / ${total}</b>`,
+    ];
+    if (st && !run.finished) {
+      meta.push(`Probe <b>${esc(run.probeFreq)} Hz</b>`, `Trial <b>${run.trialNo}</b>`,
+        `Reversals <b>${st.reversals.length} / ${STAIRCASE.stopAfterReversals}</b>`,
+        `Level <b>${esc(fmtDb(st.level, 0))} dBFS</b>`, `Step <b>${st.stepSize} dB</b>`);
+      if (c.method === 'B') meta.push(`Catch <b>${run.nCatch}</b>, false “heard” <b>${run.falseAlarms}</b>`);
+    }
+    $('#runMeta').innerHTML = meta.map(m => `<span>${m}</span>`).join('');
+  }
+
+  $('#pauseBtn').textContent = running && run.paused ? 'Resume' : 'Pause';
+  $('#pauseBtn').disabled = !running;
+  $('#abortBtn').disabled = !running;
+  $('#startBtn').disabled = running;
+  // Lock settings while a run is going, so the run's stimulus can't change underneath it
+  ['#stimFields', '#manualFields', '#measureFields'].forEach(s => { $(s).disabled = running; });
+  ['#comfortBtn', '#loudBtn', '#impJsonBtn', '#authorDataBtn', '#clearBtn'].forEach(s => { $(s).disabled = running; });
+  if (!running) setResponseEnabled(false);
+  else if (run.phase === 'awaiting') setResponseEnabled(true);
+}
+
+function renderAll() {
+  renderRunPanel();
+  renderStairPlot();
+  renderChartFilters();
+  renderCurveChart();
+  renderTable();
+  renderDataSummary();
+  renderManualLog();
+}
+
+function applySettingsToUI() {
+  const s = settings;
+  $('#maskerFreqSel').value = s.maskerFreqSel;
+  $('#maskerFreqCustom').value = s.maskerFreqCustom;
+  const custom = s.maskerFreqSel === 'custom';
+  $('#maskerFreqCustom').hidden = !custom; $('#maskerFreqUnit').hidden = !custom;
+  setRadio('maskerType', s.maskerType);
+  $('#maskerLevel').max = s.maskerType === 'noise' ? NOISE_MASKER_MAX_DBFS : SAFETY_CAP_DBFS;
+  $('#maskerLevel').value = s.maskerLevel;
+  $('#maskerOn').checked = s.maskerOn;
+  $('#probeFreq').value = s.probeFreq;
+  $('#probeFreqSlider').value = hzToSlider(s.probeFreq);
+  $('#probeLevel').value = s.probeLevel;
+  $('#probeLevelOut').textContent = `${fmtDb(s.probeLevel, 0)} dBFS`;
+  setRadio('method', s.method);
+  setRadio('condition', s.condition);
+  setRadio('scope', s.scope);
+  $('#themeSel').value = s.theme;
+  applyTheme();
+  loadProbeListForMasker();
+  if (s.singleProbe && currentProbeList().includes(s.singleProbe)) $('#singleProbeSel').value = s.singleProbe;
+  updateMaskerHint();
+  updateStartLabel();
+}
+
+function readUIToSettings() {
+  settings.maskerFreqSel = $('#maskerFreqSel').value;
+  settings.maskerFreqCustom = +$('#maskerFreqCustom').value || settings.maskerFreqCustom;
+  settings.maskerType = radioVal('maskerType');
+  settings.maskerLevel = +$('#maskerLevel').value;
+  settings.maskerOn = $('#maskerOn').checked;
+  settings.probeFreq = clamp(Math.round(+$('#probeFreq').value || 1000), 100, 10000);
+  settings.probeLevel = +$('#probeLevel').value;
+  settings.method = radioVal('method');
+  settings.condition = radioVal('condition');
+  settings.scope = radioVal('scope');
+  settings.singleProbe = +$('#singleProbeSel').value || null;
+  saveSettings();
+}
+
+function applyTheme() {
+  const t = settings.theme;
+  if (t === 'auto') delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = t;
+}
+
+/* ---------- event listeners ---------- */
+function wire() {
+  // Masker
+  $('#maskerFreqSel').addEventListener('change', () => {
+    const custom = $('#maskerFreqSel').value === 'custom';
+    $('#maskerFreqCustom').hidden = !custom; $('#maskerFreqUnit').hidden = !custom;
+    readUIToSettings(); loadProbeListForMasker(); updateManualHint();
+  });
+  $('#maskerFreqCustom').addEventListener('change', () => { readUIToSettings(); loadProbeListForMasker(); updateManualHint(); });
+  $$('input[name="maskerType"]').forEach(r => r.addEventListener('change', () => { updateMaskerHint(); readUIToSettings(); }));
+  $('#maskerLevel').addEventListener('input', () => { $('#maskerLevelOut').textContent = `${fmtDb(+$('#maskerLevel').value, 0)} dBFS`; readUIToSettings(); });
+  $('#comfortBtn').addEventListener('click', () => AudioEngine.playMaskerAlone(getMaskerConfig(), 2));
+  $('#loudBtn').addEventListener('click', () => AudioEngine.playLoudCheck());
+
+  // Part 1
+  $('#maskerOn').addEventListener('change', () => { readUIToSettings(); updateManualHint(); });
+  $('#probeFreqSlider').addEventListener('input', () => { $('#probeFreq').value = sliderToHz(+$('#probeFreqSlider').value); readUIToSettings(); updateManualHint(); });
+  $('#probeFreq').addEventListener('change', () => {
+    const f = clamp(Math.round(+$('#probeFreq').value || 1000), 100, 10000);
+    $('#probeFreq').value = f; $('#probeFreqSlider').value = hzToSlider(f); readUIToSettings(); updateManualHint();
+  });
+  $('#probeLevel').addEventListener('input', () => { $('#probeLevelOut').textContent = `${fmtDb(+$('#probeLevel').value, 0)} dBFS`; readUIToSettings(); });
+  $('#manPlayBtn').addEventListener('click', playManual);
+  $('#manHeardBtn').addEventListener('click', () => respondManual('heard'));
+  $('#manNotBtn').addEventListener('click', () => respondManual('not heard'));
+
+  // Parts 2–3
+  $$('input[name="method"]').forEach(r => r.addEventListener('change', () => { readUIToSettings(); if (!isRunning()) { renderRunPanel(); renderStairPlot(); } }));
+  $$('input[name="condition"], input[name="scope"]').forEach(r => r.addEventListener('change', () => { readUIToSettings(); updateStartLabel(); }));
+  $('#probeList').addEventListener('input', () => onProbeListInput(true));
+  $('#singleProbeSel').addEventListener('change', readUIToSettings);
+  $('#resetListBtn').addEventListener('click', () => { delete settings.probeLists[getMaskerFreq()]; saveSettings(); loadProbeListForMasker(); });
+  $('#startBtn').addEventListener('click', () => {
+    const list = currentProbeList();
+    if (!list.length) { $('#listError').textContent = 'Enter at least one probe frequency.'; return; }
+    const cfg = { method: radioVal('method'), condition: radioVal('condition'), ...getMaskerConfig() };
+    const full = radioVal('scope') === 'full';
+    startRun(cfg, full ? list : [+$('#singleProbeSel').value], full);
+  });
+  $('#pauseBtn').addEventListener('click', togglePause);
+  $('#abortBtn').addEventListener('click', abortRun);
+  $('#breakPauseBtn').addEventListener('click', () => { if (isRunning() && !run.paused) togglePause(); $('#breakBanner').hidden = true; });
+  $('#breakDismissBtn').addEventListener('click', () => { $('#breakBanner').hidden = true; });
+
+  // Response buttons
+  $('#heardBtn').addEventListener('click', () => respond('heard'));
+  $('#notHeardBtn').addEventListener('click', () => respond('not heard'));
+  $('#int1').addEventListener('click', () => respond(1));
+  $('#int2').addEventListener('click', () => respond(2));
+  $('#replayBtn').addEventListener('click', replayTrial);
+
+  // Dashboard filters
+  $$('input[name="yMode"]').forEach(r => r.addEventListener('change', () => { settings.chart.yMode = radioVal('yMode'); saveSettings(); renderChartFilters(); renderCurveChart(); }));
+  $('#showBaseline').addEventListener('change', () => { settings.chart.showBaseline = $('#showBaseline').checked; saveSettings(); renderCurveChart(); });
+  $('#fMethod').addEventListener('change', () => { settings.chart.method = $('#fMethod').value; saveSettings(); renderChartFilters(); renderCurveChart(); renderTable(); });
+  $('#fType').addEventListener('change', () => { settings.chart.maskerType = $('#fType').value; saveSettings(); renderChartFilters(); renderCurveChart(); renderTable(); });
+  $('#fLevel').addEventListener('change', () => { settings.chart.maskerLevel = +$('#fLevel').value; saveSettings(); renderChartFilters(); renderCurveChart(); renderTable(); });
+
+  // Table actions (event delegation)
+  $('#resultsTable').addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.rerun) rerunGroup(b.dataset.rerun);
+    if (b.dataset.dellast) deleteLastInGroup(b.dataset.dellast);
+  });
+
+  // Data
+  $('#expTrialsBtn').addEventListener('click', () => download(`masking_trials_${stamp()}.csv`, toCSV(data.trials, TRIAL_COLS), 'text/csv'));
+  $('#expThrBtn').addEventListener('click', () => download(`masking_thresholds_${stamp()}.csv`, toCSV(data.thresholds, THR_COLS), 'text/csv'));
+  $('#expJsonBtn').addEventListener('click', () => download(`masking_data_${stamp()}.json`,
+    JSON.stringify({ app: 'Masking Curve Lab', version: 1, exportedAt: new Date().toISOString(),
+      constants: { MASKER_DUR, PROBE_DUR, PROBE_DELAY, RAMP_DUR, ISI_2IFC, STAIRCASE, CATCH_TRIAL_RATE, SAFETY_CAP_DBFS },
+      settings, trials: data.trials, thresholds: data.thresholds }, null, 2), 'application/json'));
+  $('#impJsonBtn').addEventListener('click', () => $('#impFile').click());
+  $('#impFile').addEventListener('change', e => { const f = e.target.files[0]; if (f) importJSON(f); e.target.value = ''; });
+  $('#clearBtn').addEventListener('click', () => {
+    if (!confirm('Delete ALL stored trials and thresholds from this browser? This cannot be undone.\n\nTip: export JSON first.')) return;
+    data = { trials: [], thresholds: [] };
+    saveData();
+    run = null;
+    $('#authorNote').hidden = true;
+    setStatus(''); setLastResult(null);
+    renderAll();
+  });
+  $('#authorDataBtn').addEventListener('click', () => loadAuthorData(false));
+
+  // Header
+  $('#themeSel').addEventListener('change', () => { settings.theme = $('#themeSel').value; saveSettings(); applyTheme(); });
+  $('#reportBtn').addEventListener('click', () => {
+    const on = document.body.classList.toggle('report');
+    $('#reportBtn').textContent = on ? 'Exit report view' : 'Report view';
+  });
+
+  // Keyboard shortcuts: Method B → H / N, Method C → 1 / 2, Space → replay.
+  // Without a run: Space plays a manual trial, H / N answer it.
+  document.addEventListener('keydown', e => {
+    const tag = e.target.tagName;
+    const typing = (tag === 'INPUT' && !['radio', 'checkbox', 'range'].includes(e.target.type)) || tag === 'TEXTAREA' || tag === 'SELECT';
+    if (typing || e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+    const k = e.key.toLowerCase();
+    if (k === ' ') {
+      e.preventDefault();
+      if (document.activeElement && document.activeElement.tagName === 'BUTTON') document.activeElement.blur();
+    }
+    if (isRunning()) {
+      if (k === ' ') replayTrial();
+      else if (run.config.method === 'B' && k === 'h') respond('heard');
+      else if (run.config.method === 'B' && k === 'n') respond('not heard');
+      else if (run.config.method === 'C' && (k === '1' || k === '2')) respond(+k);
+    } else {
+      if (k === ' ') playManual();
+      else if (k === 'h') respondManual('heard');
+      else if (k === 'n') respondManual('not heard');
+    }
+  });
+
+  // Tooltips for chart points
+  const tip = $('#tip');
+  document.addEventListener('mousemove', e => {
+    const t = e.target.closest ? e.target.closest('[data-tip]') : null;
+    if (!t) { tip.hidden = true; return; }
+    tip.innerHTML = t.getAttribute('data-tip');
+    tip.hidden = false;
+    const r = tip.getBoundingClientRect();
+    let x = e.clientX + 14, y = e.clientY + 14;
+    if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - 14;
+    if (y + r.height > window.innerHeight - 8) y = e.clientY - r.height - 14;
+    tip.style.left = x + 'px'; tip.style.top = y + 'px';
+  });
+
+  // Re-draw charts when their width changes (window resize, report view)
+  const widths = new Map();
+  const ro = new ResizeObserver(entries => {
+    for (const en of entries) {
+      const w = Math.round(en.contentRect.width);
+      if (widths.get(en.target) === w) continue;
+      widths.set(en.target, w);
+      if (en.target.id === 'curveChart') renderCurveChart(); else renderStairPlot();
+    }
+  });
+  ro.observe($('#curveChart'));
+  ro.observe($('#stairChart'));
+}
+
+/* ---------- start-up ---------- */
+loadData();
+loadSettings();
+wire();
+applySettingsToUI();
+renderAll();
+const authorLoadedBefore = Store.load(AUTHOR_FLAG_KEY, false);
+if (authorLoadedBefore && data.thresholds.length) $('#authorNote').hidden = false;
+if (location.protocol.startsWith('http') && !authorLoadedBefore && !data.trials.length && !data.thresholds.length) loadAuthorData(true);
+</script>
+</body>
+</html>
